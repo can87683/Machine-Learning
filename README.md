@@ -1,10 +1,8 @@
 # Train with 10,000 bars multi-timeframe multi-symbols free data from any MT5 demo/trade account
 
-Usage:
+Usage: Running as Python scripts is most efficient
 
-Running as Python scripts is most efficient.
-
-One Python Venv for all scripts with one heavy Pytorch setup
+# One Python Venv for all scripts with one heavy Pytorch setup
 Machine-Learning-Model-Trainers
 
 Catboost (Categorical Boosting)
