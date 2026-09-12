@@ -1,4 +1,6 @@
-Use
+# Train with 10,000 bars multi-timeframe multi-symbols free data from any MT5 demo/trade account
+
+Usage:
 
 Running as Python scripts is most efficient.
 
