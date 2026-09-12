@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ai_predict_train_lstm.py
-# BSD-C-3 License
+# Copyright Su Nie | BSD-3C License | https://github.com/can87683
 
 import setproctitle
 setproctitle.setproctitle("ai_predict_train_lstm")
@@ -991,8 +991,9 @@ class LSTMTrainerGUI(CTk):
 
         title_frame = CTkFrame(main_frame, corner_radius=6)
         title_frame.pack(fill="x", pady=(0, 4))
-        CTkLabel(title_frame, text="🎯 LSTM Model Trainer (per timeframe)", font=("Ubuntu", 16, "bold")).pack(pady=4)
-        CTkLabel(title_frame, text="BSD-C-3 License", font=("Ubuntu", 18), text_color="yellow").pack(pady=(0, 4))
+
+        CTkLabel(title_frame, text="Copyright Su Nie | BSD-3C License | https://github.com/can87683", font=("Ubuntu", 16), text_color="yellow").pack(pady=(0, 4))
+        CTkLabel(title_frame, text="🎯 LSTM Model Trainer (per timeframe)", font=("Ubuntu", 20, "bold")).pack(pady=4)
 
         self.usage_row = UsageRow(main_frame)
         self._create_csv_section(main_frame)

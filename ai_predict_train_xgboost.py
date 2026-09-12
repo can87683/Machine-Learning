@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-# ai_predict_train_xgboost_ctk.py
-# BSD-C-3 License
-
+# ai_predict_train_xgboost.py
+# Copyright Su Nie | BSD-3C License | https://github.com/can87683
 
 import setproctitle
-setproctitle.setproctitle("ai_predict_train_xgboost_ctk")
+setproctitle.setproctitle("ai_predict_train_xgboost")
 
 import customtkinter as ctk
 from customtkinter import CTk, CTkFrame, CTkLabel, CTkButton, CTkEntry, CTkTextbox, CTkCheckBox
@@ -479,15 +478,16 @@ class XGBoostTrainerGUI(CTk):
         self.after(500, self.scan_data); self.protocol("WM_DELETE_WINDOW", self._on_closing)
 
     def _create_ui(self):
-        m = CTkFrame(self, fg_color="transparent"); m.pack(fill="both", expand=True, padx=10, pady=5)
-        t = CTkFrame(m, corner_radius=6); t.pack(fill="x", pady=(0, 4))
-        CTkLabel(t, text="🎯 XGBoost Model Trainer", font=("Ubuntu", 16, "bold")).pack(pady=4)
-        CTkLabel(t, text="BSD-C-3 License", font=("Ubuntu", 18), text_color="yellow").pack(pady=(0, 4))
-        UsageRow(m)
+        main_frame = CTkFrame(self, fg_color="transparent"); main_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        title_frame = CTkFrame(main_frame, corner_radius=6); title_frame.pack(fill="x", pady=(0, 4))
 
-        self._create_csv(m); self._create_model(m); self._create_params(m)
-        self._create_feats(m); self._create_tfs(m); self._create_inds(m)
-        self._create_ctrls(m); self._create_stat(m); self._create_log(m)
+        CTkLabel(title_frame, text="Copyright Su Nie | BSD-3C License | https://github.com/can87683", font=("Ubuntu", 16), text_color="yellow").pack(pady=(0, 4))
+
+        CTkLabel(title_frame, text="🎯 XGBoost Model Trainer", font=("Ubuntu", 20, "bold")).pack(pady=4)
+
+        self._create_csv(main_frame); self._create_model(main_frame); self._create_params(main_frame)
+        self._create_feats(main_frame); self._create_tfs(main_frame); self._create_inds(main_frame)
+        self._create_ctrls(main_frame); self._create_stat(main_frame); self._create_log(main_frame)
 
     def _create_csv(self, p):
         f = CTkFrame(p, corner_radius=6); f.pack(fill="x", pady=(0, 4))
@@ -646,6 +646,7 @@ class XGBoostTrainerGUI(CTk):
                 self.after(100, self.destroy)
         else:
             if messagebox.askyesno("Quit", "Quit?"): self.destroy()
+
 
 def main():
     XGBoostTrainerGUI().mainloop()

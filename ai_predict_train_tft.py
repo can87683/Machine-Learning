@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# ai_predict_train_tft_ctk.py
-# BSD-C-3 License
+# ai_predict_train_tft.py
+# Copyright Su Nie | BSD-3C License | https://github.com/can87683
 
 import setproctitle
 setproctitle.setproctitle("ai_predict_train_tft_ctk")
@@ -646,8 +646,9 @@ class TFTTrainerGUI(CTk):
     def _create_ui(self):
         main_frame = CTkFrame(self, fg_color="transparent"); main_frame.pack(fill="both", expand=True, padx=10, pady=5)
         title_frame = CTkFrame(main_frame, corner_radius=6); title_frame.pack(fill="x", pady=(0, 4))
-        CTkLabel(title_frame, text="🎯 TFT Model Trainer", font=("Ubuntu", 16, "bold")).pack(pady=4)
-        CTkLabel(title_frame, text="BSD-C-3 License", font=("Ubuntu", 18), text_color="yellow").pack(pady=(0, 4))
+
+        CTkLabel(title_frame, text="Copyright Su Nie | BSD-3C License | https://github.com/can87683", font=("Ubuntu", 16), text_color="yellow").pack(pady=(0, 4))
+        CTkLabel(title_frame, text="🎯 TFT Model Trainer", font=("Ubuntu", 20, "bold")).pack(pady=4)
 
         UsageRow(main_frame)
         self._create_csv_section(main_frame); self._create_model_folder_section(main_frame)

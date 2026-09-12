@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# ai_predict_train_catboost_ctk.py
-# CBSD-C-3 License
+# ai_predict_train_catboost.py
+# Copyright Su Nie | BSD-3C License | https://github.com/can87683
 
 import setproctitle
 setproctitle.setproctitle("ai_predict_train_catboost_ctk")
@@ -1053,9 +1053,9 @@ class CatBoostTrainerGUI(CTk):
         title_frame = CTkFrame(main_frame, corner_radius=8)
         title_frame.pack(fill="x", pady=(0, 5))
 
+        CTkLabel(title_frame, text="Copyright Su Nie | BSD-3C License | https://github.com/can87683", font=("Ubuntu", 16), text_color="yellow").pack(pady=(0, 4))
         CTkLabel(title_frame, text="🎯 CatBoost Model Trainer (per timeframe)",
-                 font=("Ubuntu", 17, "bold")).pack(pady=6)
-        CTkLabel(title_frame, text="BSD-C-3 License", font=("Ubuntu", 18), text_color="yellow").pack(pady=(0, 4))
+                 font=("Ubuntu", 20, "bold")).pack(pady=6)
 
         self.usage_row = UsageRow(main_frame)
 

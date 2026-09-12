@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # ai_predict_train_finrl.py
+# Copyright Su Nie | BSD-3C License | https://github.com/can87683
 
 import setproctitle
 setproctitle.setproctitle("ai_predict_train_finrl")
@@ -46,6 +47,7 @@ Config.ensure_directories()
 ctk.set_appearance_mode(Config.THEME)
 ctk.set_default_color_theme(Config.COLOR_THEME)
 
+
 class UsageRow:
     def __init__(self, parent):
         self.usage_frame = ctk.CTkFrame(parent, height=40, corner_radius=5)
@@ -66,6 +68,7 @@ class UsageRow:
             vram_percent = gpus[0].memoryUtil * 100
         self.usage_label.configure(text=f"CPU: {cpu:.1f}%  DRAM: {dram:.1f}%  GPU: {gpu_percent:.1f}%  VRAM: {vram_percent:.1f}%")
         self.usage_label.after(2000, self._update_usage)
+
 
 class GUILogger:
     def __init__(self):
@@ -94,6 +97,7 @@ class GUILogger:
             self._write(msg, lvl)
         else:
             self.messages.append((msg, lvl))
+
 
 class TradingEnv(gym.Env):
     def __init__(self, df, initial_balance=10000):
@@ -267,8 +271,12 @@ class FinRLTrainerGUI(ctk.CTk):
         m.pack(fill="both", expand=True, padx=10, pady=5)
         t = ctk.CTkFrame(m, corner_radius=6)
         t.pack(fill="x", pady=(0, 4))
-        ctk.CTkLabel(t, text="🎯 FinRL Model Trainer", font=("Ubuntu", 16, "bold")).pack(pady=4)
+
+        ctk.CTkLabel(t, text="Copyright Su Nie | BSD-3C License | https://github.com/can87683", font=("Ubuntu", 16), text_color="yellow").pack(pady=(0, 4))
+
+        ctk.CTkLabel(t, text="🎯 FinRL Model Trainer", font=("Ubuntu", 20, "bold")).pack(pady=4)
         UsageRow(m)
+
         self._create_csv(m)
         self._create_model(m)
         self._create_params(m)
@@ -464,6 +472,7 @@ class FinRLTrainerGUI(ctk.CTk):
         else:
             if messagebox.askyesno("Quit", "Quit?"):
                 self.destroy()
+
 
 def main():
     FinRLTrainerGUI().mainloop()
