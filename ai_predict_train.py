@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-# ai_predict_train.py
+# ai_menu_linux.py
 # Copyright Su Nie | BSD-3C License | https://github.com/can87683
 
 import setproctitle
-setproctitle.setproctitle("ai_predict_train.py")
+setproctitle.setproctitle("ai_menu_linux.py")
 
 import os
 import sys
 import threading
+import queue
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import messagebox, filedialog, StringVar
@@ -19,6 +20,7 @@ import shlex
 import psutil
 import GPUtil
 import shutil
+
 
 
 class SystemConfig:
@@ -44,7 +46,7 @@ class SystemConfig:
 
 class Config:
     def __init__(self):
-        self.title = "AI Predict Trainers"
+        self.title = "AI Menu - Copyright Su Nie | BSD-3C License | https://github.com/can87683"
         self.window_width = 640
         self.window_height = 300
         self.IPROW_FONT_SIZE = 26
@@ -145,7 +147,9 @@ class UsageRow:
             fg_color="yellow", text_color="blue", anchor="center"
         )
         self.label.pack(expand=True, fill="x")
-        self.update_usage()
+        self.result_queue = queue.Queue()
+        self.frame.after(100, self.check_queue)
+        self.frame.after(1000, self.update_usage)
 
     def update_usage(self):
         def fetch():
@@ -158,11 +162,19 @@ class UsageRow:
                 gpu = gpus[0]
                 gpu_percent = gpu.load * 100
                 vram_percent = gpu.memoryUtil * 100
-
             text = f"CPU: {cpu:.1f}%   DRAM: {dram:.1f}%   GPU: {gpu_percent:.1f}%   VRAM: {vram_percent:.1f}%"
-            self.frame.after(0, lambda: self.label.configure(text=text))
-            self.frame.after(2000, self.update_usage)
+            self.result_queue.put(text)
         threading.Thread(target=fetch, daemon=True).start()
+        self.frame.after(2000, self.update_usage)
+
+    def check_queue(self):
+        try:
+            while True:
+                text = self.result_queue.get_nowait()
+                self.label.configure(text=text)
+        except queue.Empty:
+            pass
+        self.frame.after(100, self.check_queue)
 
 
 class AIMenuGUI:
@@ -251,16 +263,23 @@ class AIMenuGUI:
         self.canvas.itemconfig(self._canvas_window, width=event.width)
 
     def _on_mousewheel(self, event):
-        if event.delta > 0 or event.num == 4:
+        if hasattr(event, 'num') and event.num == 4:
             self.canvas.yview_scroll(-1, "units")
-        else:
+        elif hasattr(event, 'num') and event.num == 5:
             self.canvas.yview_scroll(1, "units")
+        elif hasattr(event, 'delta'):
+            if event.delta > 0:
+                self.canvas.yview_scroll(-1, "units")
+            else:
+                self.canvas.yview_scroll(1, "units")
 
     def set_python_path(self):
         filename = filedialog.askopenfilename(
             title="Select Python 3.10 Binary",
             filetypes=[("Python Binaries", "python3*"), ("All Executables", "*")]
         )
+        if not filename:
+            return
         result = subprocess.run([filename, "--version"], capture_output=True, text=True, timeout=5)
         if result.returncode == 0 and "Python 3.10" in result.stdout:
             self.config.parser["python"]["binary_path"] = filename
