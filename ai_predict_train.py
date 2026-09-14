@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# ai_menu_linux.py
+# ai_predict_train.py
 # Copyright Su Nie | BSD-3C License | https://github.com/can87683
 
 import setproctitle
-setproctitle.setproctitle("ai_menu_linux.py")
+setproctitle.setproctitle("ai_predict_train.py")
 
 import os
 import sys
@@ -20,7 +20,6 @@ import shlex
 import psutil
 import GPUtil
 import shutil
-
 
 
 class SystemConfig:
@@ -46,13 +45,14 @@ class SystemConfig:
 
 class Config:
     def __init__(self):
-        self.title = "AI Menu - Copyright Su Nie | BSD-3C License | https://github.com/can87683"
+        self.title = "AI Menu"
         self.window_width = 640
         self.window_height = 300
         self.IPROW_FONT_SIZE = 26
         self.USAGE_FONT_SIZE = 20
         self.LIST_FONT_SIZE = 12
-        self.file = "ai_predict_train.ini"
+        self.max_entries = 80
+        self.file = "ai_menu_linux.ini"
         self.parser = configparser.ConfigParser()
         if os.path.exists(self.file):
             self.parser.read(self.file)
@@ -95,6 +95,7 @@ class IPRow:
         )
         self.label.pack(expand=True, fill="x")
         self.result_queue = queue.Queue()
+        self.fetch_in_progress = False
         self.frame.after(100, self.check_queue)
         self.frame.after(1000, self.update_ip_label)
 
@@ -118,13 +119,16 @@ class IPRow:
             return "--.--.--.--"
 
     def update_ip_label(self):
+        if self.fetch_in_progress:
+            self.frame.after(60000, self.update_ip_label)
+            return
+
         def fetch():
-            try:
-                lan = self.get_lan_ip()
-                wan = self.get_public_ip()
-                self.result_queue.put((lan, wan))
-            except Exception:
-                self.result_queue.put(("--.--.--.--", "--.--.--.--"))
+            self.fetch_in_progress = True
+            lan = self.get_lan_ip()
+            wan = self.get_public_ip()
+            self.result_queue.put((lan, wan))
+            self.fetch_in_progress = False
         threading.Thread(target=fetch, daemon=True).start()
         self.frame.after(60000, self.update_ip_label)
 
@@ -148,11 +152,17 @@ class UsageRow:
         )
         self.label.pack(expand=True, fill="x")
         self.result_queue = queue.Queue()
+        self.fetch_in_progress = False
         self.frame.after(100, self.check_queue)
         self.frame.after(1000, self.update_usage)
 
     def update_usage(self):
+        if self.fetch_in_progress:
+            self.frame.after(2000, self.update_usage)
+            return
+
         def fetch():
+            self.fetch_in_progress = True
             cpu = psutil.cpu_percent(interval=0.5)
             dram = psutil.virtual_memory().percent
             gpu_percent = 0.0
@@ -164,6 +174,7 @@ class UsageRow:
                 vram_percent = gpu.memoryUtil * 100
             text = f"CPU: {cpu:.1f}%   DRAM: {dram:.1f}%   GPU: {gpu_percent:.1f}%   VRAM: {vram_percent:.1f}%"
             self.result_queue.put(text)
+            self.fetch_in_progress = False
         threading.Thread(target=fetch, daemon=True).start()
         self.frame.after(2000, self.update_usage)
 
@@ -208,29 +219,35 @@ class AIMenuGUI:
             add_bar, text="Python Path", font=("Arial", 10, "bold"),
             fg_color="orange", text_color="black", command=self.set_python_path
         )
-        self.python_btn.pack(side="left", padx=2, pady=2)
+        self.python_btn.pack(side="left", padx=1, pady=1)
 
         self.python_label = ctk.CTkLabel(
             add_bar, text=os.path.basename(self.python_binary),
             font=("Arial", 10), fg_color=self.config.parser["colors"]["frame5_bg"],
             text_color="white", anchor="w"
         )
-        self.python_label.pack(side="left", padx=2, pady=2)
+        self.python_label.pack(side="left", padx=1, pady=1)
 
-        ctk.CTkLabel(add_bar, text="  ", font=("Arial", 12), fg_color=self.config.parser["colors"]["frame5_bg"], text_color="white").pack(side="left", padx=2, pady=2)
+        ctk.CTkLabel(add_bar, text="  ", font=("Arial", 12), fg_color=self.config.parser["colors"]["frame5_bg"], text_color="white").pack(side="left", padx=1, pady=1)
 
         self.add_btn = ctk.CTkButton(
             add_bar, text="+ Add Path", font=("Arial", 12),
             command=self.add_path_entry
         )
-        self.add_btn.pack(side="left", padx=2, pady=2)
+        self.add_btn.pack(side="left", padx=1, pady=1)
+
+        self.sort_btn = ctk.CTkButton(
+            add_bar, text="Sort A-Z", font=("Arial", 12),
+            command=self.sort_path_entries
+        )
+        self.sort_btn.pack(side="left", padx=1, pady=1)
 
     def build_path_container(self):
         self.frame5_container = ctk.CTkFrame(
             self.root,
             fg_color=self.config.parser["colors"]["frame5_bg"],
             border_color=self.config.parser["colors"]["border_color"],
-            border_width=2,
+            border_width=1,
             width=int(self.config.parser["window"].get("width", self.config.window_width)),
             height=650
         )
@@ -327,27 +344,34 @@ class AIMenuGUI:
         self.refresh_path_layout()
         self.save_paths_to_config()
 
+    def sort_path_entries(self):
+        self.path_entries.sort(key=lambda entry_data: os.path.basename(entry_data['full_path']).lower())
+        self.refresh_path_layout()
+        self.save_paths_to_config()
+
     def refresh_path_layout(self):
         for i, entry_data in enumerate(self.path_entries):
             col = i % 2
             row = i // 2
-            entry_data['frame'].grid(row=row, column=col, padx=2, pady=2, sticky="nsew")
+            entry_data['frame'].grid(row=row, column=col, padx=1, pady=1, sticky="nsew")
             entry_data['remove_btn'].configure(command=lambda idx=i: self.remove_path_entry(idx))
 
     def add_path_entry(self, path="", save_immediately=True):
+        if len(self.path_entries) >= self.config.max_entries:
+            messagebox.showwarning("Limit Reached", f"Maximum of {self.config.max_entries} entries reached.")
+            return
         row_idx = len(self.path_entries)
         col = row_idx % 2
         row = row_idx // 2
 
         entry_frame = ctk.CTkFrame(self.scrollable_frame, fg_color=self.config.parser["colors"]["frame5_bg"])
-        entry_frame.grid(row=row, column=col, padx=2, pady=2, sticky="nsew")
+        entry_frame.grid(row=row, column=col, padx=1, pady=1, sticky="nsew")
         entry_frame.grid_columnconfigure(0, weight=1)
         entry_frame.grid_columnconfigure(1, weight=0)
         entry_frame.grid_columnconfigure(2, weight=0)
         entry_frame.grid_columnconfigure(3, weight=0)
 
-        full_path = path
-        script_name = os.path.basename(full_path) if full_path else "[New]"
+        script_name = os.path.basename(path) if path else "[New]"
 
         name_label = ctk.CTkLabel(
             entry_frame, text=script_name,
@@ -355,48 +379,60 @@ class AIMenuGUI:
             text_color=self.config.parser["colors"]["frame5_fg"],
             anchor="w", font=("Courier", self.config.LIST_FONT_SIZE, "bold")
         )
-        name_label.grid(row=0, column=0, sticky="ew", padx=2, pady=2)
+        name_label.grid(row=0, column=0, sticky="ew", padx=1, pady=1)
+
+        entry_data = {
+            'frame': entry_frame,
+            'full_path': path,
+            'label': name_label,
+            'browse_btn': None,
+            'run_btn': None,
+            'remove_btn': None
+        }
 
         def open_browser():
-            nonlocal full_path
             filename = filedialog.askopenfilename(
                 title="Select Script or Binary",
                 filetypes=[("Python Scripts", "*.py"), ("Executables", "*.exe"), ("Shell Scripts", "*.sh"), ("All Files", "*.*")]
             )
             if filename:
-                full_path = filename
+                entry_data['full_path'] = filename
                 name_label.configure(text=os.path.basename(filename))
                 self.save_paths_to_config()
 
         btn_width = 24
 
         browse_btn = ctk.CTkButton(entry_frame, text="Br", width=btn_width, command=open_browser)
-        browse_btn.grid(row=0, column=1, padx=2, pady=2)
+        browse_btn.grid(row=0, column=1, padx=1, pady=1)
 
-        run_btn = ctk.CTkButton(entry_frame, text="R", width=btn_width, fg_color="green", text_color="white", command=lambda: self.run_path(full_path))
-        run_btn.grid(row=0, column=2, padx=2, pady=2)
+        run_btn = ctk.CTkButton(entry_frame, text="R", width=btn_width, fg_color="green", text_color="white", command=lambda: self.run_path(entry_data['full_path']))
+        run_btn.grid(row=0, column=2, padx=1, pady=1)
 
         remove_btn = ctk.CTkButton(entry_frame, text="X", width=btn_width, fg_color="red", text_color="white", command=lambda idx=row_idx: self.remove_path_entry(idx))
-        remove_btn.grid(row=0, column=3, padx=2, pady=2)
+        remove_btn.grid(row=0, column=3, padx=1, pady=1)
 
-        self.path_entries.append({
-            'frame': entry_frame,
-            'full_path': full_path,
-            'label': name_label,
-            'browse_btn': browse_btn,
-            'run_btn': run_btn,
-            'remove_btn': remove_btn
-        })
+        entry_data['browse_btn'] = browse_btn
+        entry_data['run_btn'] = run_btn
+        entry_data['remove_btn'] = remove_btn
+
+        self.path_entries.append(entry_data)
 
         if save_immediately:
             self.save_paths_to_config()
 
     def save_paths_to_config(self):
-        self.config.parser["paths"] = {}
+        # 1. Properly clear the section to avoid configparser retention bugs
+        if self.config.parser.has_section("paths"):
+            self.config.parser.remove_section("paths")
+        self.config.parser.add_section("paths")
+
+        # 2. Repopulate with current entries
         for i, entry_data in enumerate(self.path_entries):
             path = entry_data['full_path'].strip()
             if path:
                 self.config.parser["paths"][f"path_{i}"] = path
+
+        # 3. Save to file
         self.config.save()
 
     def load_paths_from_config(self):
