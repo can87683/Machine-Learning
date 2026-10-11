@@ -1,6 +1,3 @@
-"""
-customtkinter lightning numpy pandas psutil pytorch-forecasting pytorch-lightning setproctitle torch
-"""
 #!/usr/bin/env python3
 # ai_predict_train_tft.py
 # Copyright Su Nie | BSD-3C License | https://github.com/can87683
@@ -154,7 +151,6 @@ class GPUManager:
 
 
 class UsageRow:
-    # --- Display constants ---
     FRAME_HEIGHT = 40
     FRAME_CORNER_RADIUS = 5
     FRAME_PADY = (0, 10)
@@ -819,52 +815,68 @@ class StreamingTFTTrainer:
         self.is_trained = True
         self.checkpoint_path = checkpoint_callback.best_model_path
 
-        self.training_history["directional_accuracy"] = self._compute_directional_accuracy(val_loader, accelerator)
+        self.training_history["directional_accuracy"] = self._compute_directional_accuracy(val_loader)
         if self.training_history["directional_accuracy"] is not None:
             self._log(f"🎯 [{timeframe}] Directional accuracy: {self.training_history['directional_accuracy'] * 100:.1f}%")
 
         self._log(f"🏁 [{timeframe}] TFT training complete")
         return True
 
-    def _compute_directional_accuracy(self, dataloader, accelerator):
+    def _compute_directional_accuracy(self, dataloader):
+        """
+        Compute directional accuracy (median prediction vs. last actual).
+        Iterates the validation dataloader directly to avoid shape inconsistencies
+        from TemporalFusionTransformer.predict() across pytorch_forecasting versions.
+        """
         self.model.eval()
-        pred_res = self.model.predict(
-            dataloader,
-            mode="prediction",
-            return_x=True,
-            trainer_kwargs=dict(
-                accelerator=accelerator,
-                devices=1,
-                enable_progress_bar=False,
-                logger=False,
-            ),
-        )
-        preds = pred_res.output
-        if isinstance(preds, (list, tuple)):
-            preds = preds[0]
-
-        encoder_target = pred_res.x["encoder_target"]
-        decoder_target = pred_res.x["decoder_target"]
-        if isinstance(encoder_target, (list, tuple)):
-            encoder_target = encoder_target[0]
-        if isinstance(decoder_target, (list, tuple)):
-            decoder_target = decoder_target[0]
-
+        correct = 0
+        total = 0
         median_idx = len(self.quantiles) // 2
-        preds_median = preds[..., median_idx]
 
-        last_actual = encoder_target[:, -1].unsqueeze(-1)
-        actual_dir = torch.sign(decoder_target - last_actual)
-        pred_dir = torch.sign(preds_median - last_actual)
+        with torch.no_grad():
+            for batch in dataloader:
+                x, y = batch
+                x = {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in x.items()}
 
-        valid_mask = actual_dir != 0
-        if valid_mask.sum().item() == 0:
-            self.model.train()
-            return None
+                out = self.model(x)
+                preds = out[0] if isinstance(out, tuple) else out
 
-        accuracy = ((actual_dir == pred_dir) & valid_mask).float().sum().item() / valid_mask.float().sum().item()
+                if preds.dim() == 3:
+                    preds_median = preds[..., median_idx]
+                elif preds.dim() == 2:
+                    preds_median = preds
+                else:
+                    continue
+
+                target = y[0] if isinstance(y, (tuple, list)) else y
+                target = target.to(self.device)
+
+                encoder_target = x.get("encoder_target")
+                if encoder_target is None:
+                    continue
+                if isinstance(encoder_target, (list, tuple)):
+                    encoder_target = encoder_target[0]
+                encoder_target = encoder_target.to(self.device)
+
+                last_actual = encoder_target[:, -1].unsqueeze(-1)
+
+                actual_dir = torch.sign(target - last_actual)
+                pred_dir = torch.sign(preds_median - last_actual)
+
+                L = min(actual_dir.size(1), pred_dir.size(1))
+                if L == 0:
+                    continue
+                actual_dir = actual_dir[:, :L]
+                pred_dir = pred_dir[:, :L]
+
+                valid_mask = actual_dir != 0
+                correct += ((actual_dir == pred_dir) & valid_mask).sum().item()
+                total += valid_mask.sum().item()
+
         self.model.train()
-        return accuracy
+        if total == 0:
+            return None
+        return correct / total
 
     def save_model(self, filename):
         if not self.is_trained or self.model is None:
@@ -901,6 +913,7 @@ class StreamingTFTTrainer:
         self._log(f"✅ [{self.timeframe}] Metadata saved: {metadata_path}")
         return True
 
+
 class TFTTrainerGUI(CTk):
     INI_PATH = Path(__file__).with_suffix(".ini")
 
@@ -931,9 +944,6 @@ class TFTTrainerGUI(CTk):
         self.resizable(False, False)
         self._is_closing = False
 
-        # Hide window while we build the UI and restore saved geometry,
-        # so the user never sees the default position/size flash before
-        # the saved position is applied.
         self.withdraw()
 
         self.gui_logger = GUILogger()
@@ -951,7 +961,7 @@ class TFTTrainerGUI(CTk):
         self.current_trainer = None
 
         self._create_ui()
-        self._load_state()  # applied while the window is hidden
+        self._load_state()
         self.gui_logger.set_log_widget(self.log_text)
 
         self.gpu_manager.log_system_info()
@@ -959,7 +969,6 @@ class TFTTrainerGUI(CTk):
         self.after(500, self.scan_data_source)
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
 
-        # Flush pending geometry/layout work, then reveal the window.
         self.update_idletasks()
         self.deiconify()
 
@@ -972,24 +981,7 @@ class TFTTrainerGUI(CTk):
         if cp.has_section("window"):
             geom = cp.get("window", "geometry", fallback="")
             if geom:
-                # wm_geometry() is frame-relative and round-trips exactly
-                # through self.geometry() - no title-bar drift.
                 self.geometry(geom)
-            else:
-                # Legacy ini stored only x/y from winfo_x/winfo_y (client coords).
-                # On Windows this caused a ~37px downward creep per launch.
-                # Fall back to size only to break the drift loop.
-                x = cp.get("window", "x", fallback="")
-                y = cp.get("window", "y", fallback="")
-                if x and y:
-                    try:
-                        # winfo_x/y are client coords; geometry() expects
-                        # frame coords. Since we can't reliably reconstruct
-                        # the title-bar offset here, just restore size only
-                        # and let the WM place the window.
-                        self.geometry(Config.APP_GEOMETRY)
-                    except Exception:
-                        pass
 
         if cp.has_section("paths"):
             csv = cp.get("paths", "csv_folder", fallback="")
@@ -1017,10 +1009,6 @@ class TFTTrainerGUI(CTk):
 
     def _save_state(self):
         cp = configparser.ConfigParser()
-        # Store wm_geometry() directly. It is frame-relative (same coordinate
-        # system that geometry() consumes), so a save/restore round-trip is
-        # exact. Using winfo_x()/winfo_y() instead caused the ~37px downward
-        # creep per launch because those return client-area coords.
         cp["window"] = {"geometry": self.wm_geometry()}
         cp["paths"] = {"csv_folder": str(self.csv_path_var.get()), "model_folder": str(self.model_path_var.get())}
         cp["params"] = {
