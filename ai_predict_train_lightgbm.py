@@ -1,6 +1,10 @@
+"""
+customtkinter lightgbm numpy pandas psutil setproctitle torch
+"""
 #!/usr/bin/env python3
 # ai_predict_train_lightgbm.py
 # Copyright Su Nie | BSD-3C License | https://github.com/can87683
+
 
 import setproctitle
 setproctitle.setproctitle("ai_predict_train_lightgbm_ctk")
@@ -11,41 +15,29 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 import threading
 import subprocess
+import configparser
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import pickle
-import json
 import gc
 import psutil
 from datetime import datetime
-import traceback
 import sys
-import os
 import time
-import warnings
 
 import lightgbm as lgb
 
-# Suppress FutureWarnings
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
-
 
 class Config:
-    """Central configuration for all settings"""
-
-    # Paths
     HOME = Path.home()
     MODEL_DIR = HOME / "ai_model_ml"
     DATASET_DIR = HOME / "mt5_data"
 
-    # Data settings
     MAX_ROWS_PER_SYMBOL = 20000
     MAX_DATASET_ROWS = 200000
-    DEFAULT_FEATURES = ['time', 'open', 'high', 'low', 'close', 'volume']
+    DEFAULT_FEATURES = ['time', 'open', 'high', 'low', 'close', 'tick_volume']
 
-    # Model settings (LightGBM)
     DEFAULT_HORIZON = 10
     DEFAULT_ITERATIONS = 1000
     DEFAULT_LEARNING_RATE = 0.05
@@ -95,85 +87,106 @@ DATASET_DIR = Config.DATASET_DIR
 
 
 class GPUManager:
-    def __init__(self, verbose=True):
+    def __init__(self, verbose=True, log_callback=None):
         self.verbose = verbose
         self.gpu_available = False
         self.gpu_name = None
+        self.gpu_memory_gb = 0.0
+        self.log_callback = log_callback or print
         self._detect_gpu()
 
     def _log(self, message):
-        if self.verbose:
+        if self.log_callback:
+            self.log_callback(message)
+        elif self.verbose:
             print(f"[GPUManager] {message}")
 
     def _detect_gpu(self):
-        try:
-            result = subprocess.run(
-                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-                capture_output=True,
-                text=True,
-                timeout=3,
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            self.gpu_available = True
+            self.gpu_name = result.stdout.strip().splitlines()[0]
+            mem_result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=3
             )
-            if result.returncode == 0 and result.stdout.strip():
-                self.gpu_available = True
-                self.gpu_name = result.stdout.strip().splitlines()[0]
-                self._log(f"✅ GPU detected: {self.gpu_name}")
-            else:
-                self._log("ℹ️ No GPU detected, using CPU")
-        except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
-            self.gpu_available = False
+            self.gpu_memory_gb = float(mem_result.stdout.strip().split()[0]) / 1024.0
+            self._log(f"✅ GPU detected: {self.gpu_name} ({self.gpu_memory_gb:.2f} GB)")
+        else:
             self._log("ℹ️ No GPU detected, using CPU")
+
+    def log_system_info(self):
+        self._log("=" * 60)
+        self._log("🖥️ System & Library Information")
+        self._log("=" * 60)
+        self._log(f"🐍 Python: {sys.version.split()[0]}")
+        self._log(f"🚀 LightGBM: {lgb.__version__}")
+        self._log("=" * 60)
 
     def preferred_devices(self):
         if self.gpu_available:
-            return ["cuda", "gpu", "cpu"]
+            return ["gpu", "cpu"]
         return ["cpu"]
 
 
 class UsageRow:
-    def __init__(self, parent):
-        self.parent = parent
-        self.usage_frame = None
-        self.usage_label = None
-        self._create_usage_row()
+    # --- Display constants ---
+    FRAME_HEIGHT = 40
+    FRAME_CORNER_RADIUS = 5
+    FRAME_PADY = (0, 10)
 
-    def _create_usage_row(self):
-        self.usage_frame = CTkFrame(self.parent, height=35, corner_radius=5)
-        self.usage_frame.pack(fill="x", pady=(0, 5))
+    FONT = ("Ubuntu Mono", 20)
+    TEXT_COLOR = "Lime"
+    PLACEHOLDER_TEXT = "Loading system usage..."
+
+    LABEL_PADX = 10
+    LABEL_PADY = 5
+
+    REFRESH_MS = 2000
+    CPU_SAMPLE_INTERVAL = 0.5
+
+    def __init__(self, parent):
+        self.usage_frame = CTkFrame(
+            parent,
+            height=self.FRAME_HEIGHT,
+            corner_radius=self.FRAME_CORNER_RADIUS,
+        )
+        self.usage_frame.pack(fill="x", pady=self.FRAME_PADY)
 
         self.usage_label = CTkLabel(
             self.usage_frame,
-            text="Loading system usage...",
-            font=("Ubuntu Mono", 18),
-            text_color="Lime"
+            text=self.PLACEHOLDER_TEXT,
+            font=self.FONT,
+            text_color=self.TEXT_COLOR,
         )
-        self.usage_label.pack(expand=True, fill="x", padx=10, pady=3)
-
+        self.usage_label.pack(
+            expand=True, fill="x",
+            padx=self.LABEL_PADX, pady=self.LABEL_PADY,
+        )
         self._update_usage()
 
     def _update_usage(self):
+        cpu = psutil.cpu_percent(interval=self.CPU_SAMPLE_INTERVAL)
+        dram = psutil.virtual_memory().percent
+        gpu_percent = vram_percent = 0
         try:
-            cpu = psutil.cpu_percent(interval=0.5)
-            dram = psutil.virtual_memory().percent
-
-            gpu_percent = 0
-            vram_percent = 0
-            try:
-                import GPUtil
-                gpus = GPUtil.getGPUs()
-                if gpus:
-                    gpu = gpus[0]
-                    gpu_percent = gpu.load * 100
-                    vram_percent = gpu.memoryUtil * 100
-            except (ImportError, Exception):
-                pass
-
-            self.usage_label.configure(
-                text=f"CPU: {cpu:.1f}%  DRAM: {dram:.1f}%  GPU: {gpu_percent:.1f}%  VRAM: {vram_percent:.1f}%"
-            )
-        except Exception:
-            self.usage_label.configure(text="⚠️ System monitoring unavailable")
-
-        self.usage_label.after(2000, self._update_usage)
+            import GPUtil
+            gpus = GPUtil.getGPUs()
+            if gpus:
+                gpu_percent = gpus[0].load * 100
+                vram_percent = gpus[0].memoryUtil * 100
+        except ImportError:
+            pass
+        self.usage_label.configure(
+            text=f"CPU: {cpu:.1f}%  DRAM: {dram:.1f}%  "
+                 f"GPU: {gpu_percent:.1f}%  VRAM: {vram_percent:.1f}%"
+        )
+        self.usage_label.after(self.REFRESH_MS, self._update_usage)
 
 
 class ConsoleLogger:
@@ -268,8 +281,8 @@ class FeatureEngineer:
             df['returns_5'] = df['close'].pct_change(periods=5)
             df['returns_10'] = df['close'].pct_change(periods=10)
 
-        if 'volume' in df.columns:
-            df['volume_ratio'] = df['volume'] / df['volume'].rolling(5, min_periods=1).mean()
+        if 'tick_volume' in df.columns:
+            df['tick_volume_ratio'] = df['tick_volume'] / df['tick_volume'].rolling(5, min_periods=1).mean()
 
         if all(c in df.columns for c in ['high', 'low', 'close']):
             prev_close = df['close'].shift(1)
@@ -309,10 +322,10 @@ class FeatureEngineer:
             df['macd_signal'] = signal_line
             df['macd_hist'] = macd_line - signal_line
 
-        if flags.get('enable_mfi', False) and all(c in df.columns for c in ['high', 'low', 'close', 'volume']):
+        if flags.get('enable_mfi', False) and all(c in df.columns for c in ['high', 'low', 'close', 'tick_volume']):
             df = FeatureEngineer._add_mfi(df, period=14)
 
-        if flags.get('enable_obv', False) and all(c in df.columns for c in ['close', 'volume']):
+        if flags.get('enable_obv', False) and all(c in df.columns for c in ['close', 'tick_volume']):
             df = FeatureEngineer._add_obv(df)
 
         if flags.get('enable_roc', False) and 'close' in df.columns:
@@ -329,13 +342,13 @@ class FeatureEngineer:
         if flags.get('enable_stochastic', False) and all(c in df.columns for c in ['high', 'low', 'close']):
             df = FeatureEngineer._add_stochastic(df, period=14, smooth=3)
 
-        if flags.get('enable_vol_ma', False) and 'volume' in df.columns:
-            df['volume_ema_20'] = df['volume'].ewm(span=20, min_periods=1, adjust=False).mean()
-            df['volume_sma_20'] = df['volume'].rolling(20, min_periods=1).mean()
+        if flags.get('enable_vol_ma', False) and 'tick_volume' in df.columns:
+            df['volume_ema_20'] = df['tick_volume'].ewm(span=20, min_periods=1, adjust=False).mean()
+            df['volume_sma_20'] = df['tick_volume'].rolling(20, min_periods=1).mean()
 
-        if flags.get('enable_vwap', False) and all(c in df.columns for c in ['high', 'low', 'close', 'volume']):
+        if flags.get('enable_vwap', False) and all(c in df.columns for c in ['high', 'low', 'close', 'tick_volume']):
             typical = (df['high'] + df['low'] + df['close']) / 3
-            df['vwap'] = (typical * df['volume']).cumsum() / df['volume'].cumsum()
+            df['vwap'] = (typical * df['tick_volume']).cumsum() / df['tick_volume'].cumsum()
 
         if flags.get('enable_willr', False) and all(c in df.columns for c in ['high', 'low', 'close']):
             lowest = df['low'].rolling(14, min_periods=1).min()
@@ -414,7 +427,7 @@ class FeatureEngineer:
     @staticmethod
     def _add_mfi(df, period=14):
         typical = (df['high'] + df['low'] + df['close']) / 3
-        raw_money = typical * df['volume']
+        raw_money = typical * df['tick_volume']
         diff = typical.diff()
         positive = raw_money.where(diff > 0, 0)
         negative = raw_money.where(diff < 0, 0)
@@ -426,15 +439,8 @@ class FeatureEngineer:
 
     @staticmethod
     def _add_obv(df):
-        obv = [0]
-        for i in range(1, len(df)):
-            if df['close'].iloc[i] > df['close'].iloc[i-1]:
-                obv.append(obv[-1] + df['volume'].iloc[i])
-            elif df['close'].iloc[i] < df['close'].iloc[i-1]:
-                obv.append(obv[-1] - df['volume'].iloc[i])
-            else:
-                obv.append(obv[-1])
-        df['obv'] = pd.Series(obv, index=df.index)
+        direction = np.sign(df['close'].diff()).fillna(0.0)
+        df['obv'] = (direction * df['tick_volume']).cumsum()
         return df
 
 
@@ -449,30 +455,23 @@ class GUILogger:
     def set_log_widget(self, widget):
         self.log_widget = widget
         self.ready = True
-        self.log_widget.configure(font=("Ubuntu Mono", 11))
+        self.log_widget.configure(font=("Ubuntu Mono", 10))
         for msg, level in self.messages:
             self._write_to_widget(msg, level)
         self.messages.clear()
 
     def _write_to_widget(self, message, level):
-        if self.log_widget:
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            log_entry = f"[{timestamp}] {message}\n"
-            try:
-                self.log_widget.insert("end", log_entry)
-                self.log_widget.see("end")
-                self.log_widget.update_idletasks()
-            except Exception:
-                print(log_entry, flush=True)
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_entry = f"[{timestamp}] {message}\n"
+        self.log_widget.insert("end", log_entry)
+        self.log_widget.see("end")
+        self.log_widget.update_idletasks()
 
     def log(self, message, level="info"):
         timestamp = datetime.now().strftime("%H:%M:%S")
         console_entry = f"[{timestamp}] [{level.upper()}] {message}"
-        try:
-            self._original_stdout.write(console_entry + "\n")
-            self._original_stdout.flush()
-        except Exception:
-            print(console_entry, flush=True)
+        self._original_stdout.write(console_entry + "\n")
+        self._original_stdout.flush()
         if self.ready and self.log_widget:
             self._write_to_widget(message, level)
         else:
@@ -508,25 +507,25 @@ class StreamingDataPreparer:
         csv_file = Path(csv_folder) / symbol / f"{symbol}_{timeframe}.csv"
         if not csv_file.exists():
             return None
-        try:
-            df = pd.read_csv(csv_file)
-            if "time" not in df.columns:
-                self._log(f"⚠️ Missing time column: {csv_file}")
-                return None
-            if pd.api.types.is_numeric_dtype(df["time"]):
-                df["time"] = pd.to_datetime(df["time"], unit="s")
-            else:
-                df["time"] = pd.to_datetime(df["time"])
-            df = df.sort_values("time").drop_duplicates("time").reset_index(drop=True)
-            return df
-        except Exception as exc:
-            self._log(f"❌ Error loading {csv_file}: {exc}")
+
+        df = pd.read_csv(csv_file)
+        if "time" not in df.columns:
+            self._log(f"⚠️ Missing time column: {csv_file}")
             return None
+
+        if pd.api.types.is_numeric_dtype(df["time"]):
+            df["time"] = pd.to_datetime(df["time"], unit="s")
+        else:
+            df["time"] = pd.to_datetime(df["time"])
+
+        df = df.sort_values("time").drop_duplicates("time").reset_index(drop=True)
+        return df
 
     def scan_folder(self, csv_folder):
         csv_folder = Path(csv_folder)
         if not csv_folder.exists():
             return [], []
+
         symbols = []
         all_timeframes = set()
         for symbol_dir in sorted(csv_folder.iterdir()):
@@ -560,7 +559,7 @@ class StreamingDataPreparer:
             "hour_sin", "hour_cos", "day_sin", "day_cos",
             "month_sin", "month_cos",
             "high_low_ratio", "close_high_ratio", "close_low_ratio",
-            "returns_1", "returns_5", "returns_10", "volume_ratio",
+            "returns_1", "returns_5", "returns_10", "tick_volume_ratio",
         ]
 
         indicator_features = []
@@ -571,7 +570,7 @@ class StreamingDataPreparer:
         candidate_features = list(dict.fromkeys(requested_features + base_engineered + indicator_features))
         available_features = [c for c in candidate_features if c in df.columns]
 
-        required_columns = ["open", "high", "low", "close", "volume"]
+        required_columns = ["open", "high", "low", "close", "tick_volume"]
         for column in required_columns:
             if column in df.columns and column not in available_features:
                 available_features.append(column)
@@ -661,7 +660,7 @@ class StreamingLightGBMTrainer:
     def __init__(self, log_callback=None, timeframe=None):
         self.log_callback = log_callback or print
         self.timeframe = timeframe
-        self.gpu_manager = GPUManager(verbose=False)
+        self.gpu_manager = GPUManager(verbose=False, log_callback=self.log_callback)
         self.model = None
         self.is_trained = False
         self.stop_flag = False
@@ -694,35 +693,38 @@ class StreamingLightGBMTrainer:
         train_parts, val_parts = [], []
         for _, group in data.groupby("group_id"):
             group = group.sort_values("time_idx")
-            n_val = max(1, int(len(group) * Config.VALIDATION_FRACTION))
+            n = len(group)
+            if n < 5:
+                train_parts.append(group)
+                continue
+            n_val = max(1, int(n * Config.VALIDATION_FRACTION))
+            n_val = min(n_val, n - 1)
             train_parts.append(group.iloc[:-n_val])
             val_parts.append(group.iloc[-n_val:])
-        return pd.concat(train_parts, ignore_index=True), pd.concat(val_parts, ignore_index=True)
+        train_df = pd.concat(train_parts, ignore_index=True)
+        val_df = pd.concat(val_parts, ignore_index=True)
+        return train_df, val_df
 
     def _compute_directional_accuracy(self, model, X_val, val_df):
-        try:
-            if "close" not in val_df.columns:
-                return None
-            predictions = model.predict(X_val)
-            last_close = val_df["close"].to_numpy()
-            actual_target = val_df["target"].to_numpy()
-            actual_direction = np.sign(actual_target - last_close)
-            predicted_direction = np.sign(predictions - last_close)
-            valid_mask = actual_direction != 0
-            if valid_mask.sum() == 0:
-                return None
-            matches = (actual_direction == predicted_direction) & valid_mask
-            return float(matches.sum() / valid_mask.sum())
-        except Exception as exc:
-            self._log(f"⚠️ Could not compute directional accuracy: {exc}")
+        if "close" not in val_df.columns:
             return None
+        predictions = model.predict(X_val)
+        last_close = val_df["close"].to_numpy()
+        actual_target = val_df["target"].to_numpy()
+        actual_direction = np.sign(actual_target - last_close)
+        predicted_direction = np.sign(predictions - last_close)
+        valid_mask = actual_direction != 0
+        if valid_mask.sum() == 0:
+            return None
+        matches = (actual_direction == predicted_direction) & valid_mask
+        return float(matches.sum() / valid_mask.sum())
 
-    def _build_model(self, device_type, iterations, learning_rate, max_depth):
+    def _build_model(self, device_type, iterations, learning_rate, max_depth, num_leaves=None):
         params = dict(
             n_estimators=iterations,
             learning_rate=learning_rate,
             max_depth=max_depth,
-            num_leaves=self.num_leaves,
+            num_leaves=num_leaves if num_leaves is not None else self.num_leaves,
             reg_lambda=self.reg_lambda,
             subsample=self.subsample,
             subsample_freq=self.bagging_freq,
@@ -749,137 +751,136 @@ class StreamingLightGBMTrainer:
         max_depth=None,
         **kwargs,
     ):
-        try:
-            self.stop_flag = False
-            self.timeframe = timeframe
+        self.stop_flag = False
+        self.timeframe = timeframe
 
-            tf_params = Config.TIMEFRAME_HYPERPARAMS.get(timeframe, {})
-            if iterations is None:
-                iterations = tf_params.get("iterations", self.iterations)
-            if max_depth is None:
-                max_depth = tf_params.get("max_depth", self.max_depth)
-            self.reg_lambda = tf_params.get("reg_lambda", self.reg_lambda)
+        tf_params = Config.TIMEFRAME_HYPERPARAMS.get(timeframe, {})
+        if iterations is None:
+            iterations = tf_params.get("iterations", self.iterations)
+        if max_depth is None:
+            max_depth = tf_params.get("max_depth", self.max_depth)
+        self.reg_lambda = tf_params.get("reg_lambda", self.reg_lambda)
 
-            if len(data) == 0:
-                raise ValueError("Prepared dataframe is empty")
+        effective_num_leaves = min(self.num_leaves, max(2, 2 ** int(max_depth) - 1))
+        self._log(f"🌲 [{timeframe}] num_leaves clamped to {effective_num_leaves} (max_depth={max_depth})")
 
-            train_df, val_df = self._chronological_split(data)
-            if len(train_df) == 0 or len(val_df) == 0:
-                raise ValueError("Train/validation split produced an empty set")
+        if len(data) == 0:
+            raise ValueError("Prepared dataframe is empty")
 
-            x_columns = feature_cols + ["group_id"]
-            X_train = train_df[x_columns].copy()
-            y_train = train_df["target"]
-            X_val = val_df[x_columns].copy()
-            y_val = val_df["target"]
+        train_df, val_df = self._chronological_split(data)
+        if len(train_df) == 0 or len(val_df) == 0:
+            raise ValueError("Train/validation split produced an empty set")
 
-            X_train["group_id"] = X_train["group_id"].astype("category")
-            X_val["group_id"] = X_val["group_id"].astype("category")
+        x_columns = feature_cols + ["group_id"]
+        X_train = train_df[x_columns].copy()
+        y_train = train_df["target"]
+        X_val = val_df[x_columns].copy()
+        y_val = val_df["target"]
 
-            self._log(f"📊 [{timeframe}] Training rows: {len(train_df):,}")
-            self._log(f"📊 [{timeframe}] Validation rows: {len(val_df):,}")
-            self._log(f"⚙️ [{timeframe}] depth={max_depth}, iterations={iterations}, l2={self.reg_lambda}")
+        X_train["group_id"] = X_train["group_id"].astype("category")
+        X_val["group_id"] = X_val["group_id"].astype("category")
 
-            last_error = None
-            fitted_model = None
-            used_device = None
+        self._log(f"📊 [{timeframe}] Training rows: {len(train_df):,}")
+        self._log(f"📊 [{timeframe}] Validation rows: {len(val_df):,}")
+        self._log(f"⚙️ [{timeframe}] depth={max_depth}, leaves={effective_num_leaves}, "
+                  f"iterations={iterations}, l2={self.reg_lambda}")
 
-            for device_type in self.gpu_manager.preferred_devices():
-                if self.stop_flag:
-                    break
-                model = self._build_model(device_type, iterations, learning_rate, max_depth)
-                self._log(f"🚀 [{timeframe}] Attempting training on device_type='{device_type}'...")
-                try:
-                    fitted_model = model.fit(
-                        X_train, y_train,
-                        eval_set=[(X_val, y_val)],
-                        eval_metric="rmse",
-                        categorical_feature=["group_id"],
-                        callbacks=[
-                            lgb.early_stopping(Config.EARLY_STOPPING_ROUNDS, verbose=False),
-                            lgb.log_evaluation(period=0),
-                        ],
-                    )
-                    used_device = device_type
-                    break
-                except Exception as exc:
-                    last_error = exc
-                    self._log(f"⚠️ [{timeframe}] device_type='{device_type}' failed ({exc}); falling back...")
-                    continue
+        last_error = None
+        fitted_model = None
+        used_device = None
 
-            if fitted_model is None:
-                raise last_error or RuntimeError("No device succeeded in training")
+        for device_type in self.gpu_manager.preferred_devices():
+            if self.stop_flag:
+                break
+            model = self._build_model(
+                device_type, iterations, learning_rate, max_depth,
+                num_leaves=effective_num_leaves,
+            )
+            self._log(f"🚀 [{timeframe}] Attempting training on device_type='{device_type}'...")
+            try:
+                fitted_model = model.fit(
+                    X_train, y_train,
+                    eval_set=[(X_val, y_val)],
+                    eval_metric="rmse",
+                    categorical_feature=["group_id"],
+                    callbacks=[
+                        lgb.early_stopping(Config.EARLY_STOPPING_ROUNDS, verbose=False),
+                        lgb.log_evaluation(period=0),
+                    ],
+                )
+                used_device = device_type
+                break
+            except Exception as exc:
+                last_error = exc
+                self._log(f"⚠️ [{timeframe}] device_type='{device_type}' failed: {exc}")
+                fitted_model = None
+                MemoryOptimizer.clear_cache()
 
-            self.model = fitted_model
-            self.device_used = used_device
-            self._log(f"✅ [{timeframe}] Trained using device_type='{used_device}'")
+        if fitted_model is None:
+            raise last_error if last_error else RuntimeError("No device succeeded in training")
 
-            best_iteration = getattr(self.model, "best_iteration_", iterations) or iterations
-            best_score_dict = getattr(self.model, "best_score_", {})
-            best_score = None
-            if best_score_dict:
-                valid_scores = best_score_dict.get("valid_0", {})
-                best_score = valid_scores.get("rmse")
+        self.model = fitted_model
+        self.device_used = used_device
+        self._log(f"✅ [{timeframe}] Trained using device_type='{used_device}'")
 
-            directional_accuracy = self._compute_directional_accuracy(self.model, X_val, val_df)
-            if directional_accuracy is not None:
-                self._log(f"🎯 [{timeframe}] Directional accuracy on validation set: {directional_accuracy * 100:.1f}% (50% = coin flip)")
+        best_iteration = getattr(self.model, "best_iteration_", None) or iterations
+        best_score_dict = getattr(self.model, "best_score_", {}) or {}
+        best_score = best_score_dict.get("valid_0", {}).get("rmse") if best_score_dict else None
 
-            self.training_history = {
-                "timeframe": timeframe,
-                "device_used": used_device,
-                "best_iteration": best_iteration,
-                "best_score": best_score,
-                "train_rows": len(train_df),
-                "val_rows": len(val_df),
-                "directional_accuracy": directional_accuracy,
-            }
-            self.is_trained = True
-            self._log(f"🏁 [{timeframe}] Training complete (device={used_device}, best_iter={best_iteration}, val_rmse={best_score})")
-            return True
+        directional_accuracy = self._compute_directional_accuracy(self.model, X_val, val_df)
+        if directional_accuracy is not None:
+            self._log(f"🎯 [{timeframe}] Directional accuracy: "
+                      f"{directional_accuracy * 100:.1f}% (50% = coin flip)")
 
-        except Exception as exc:
-            self._log(f"❌ [{timeframe}] Training error: {exc}")
-            traceback.print_exc()
-            return False
+        self.training_history = {
+            "timeframe": timeframe,
+            "device_used": used_device,
+            "best_iteration": best_iteration,
+            "best_score": best_score,
+            "train_rows": len(train_df),
+            "val_rows": len(val_df),
+            "directional_accuracy": directional_accuracy,
+        }
+        self.is_trained = True
+        self._log(f"🏁 [{timeframe}] Training complete "
+                  f"(device={used_device}, best_iter={best_iteration}, val_rmse={best_score})")
+        return True
 
     def save_model(self, model_dir, filename_stem, feature_cols, horizon, timeframe):
         if not self.is_trained or self.model is None:
             self._log("⚠️ No trained model available")
             return False
-        try:
-            output_dir = Path(model_dir)
-            output_dir.mkdir(parents=True, exist_ok=True)
-            model_path = output_dir / f"{filename_stem}{Config.MODEL_EXT}"
-            metadata_path = output_dir / f"{filename_stem}{Config.METADATA_EXT}"
 
-            self.model.booster_.save_model(str(model_path))
+        output_dir = Path(model_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        model_path = output_dir / f"{filename_stem}{Config.MODEL_EXT}"
+        metadata_path = output_dir / f"{filename_stem}{Config.METADATA_EXT}"
 
-            metadata = {
-                "model_type": "lightgbm.LGBMRegressor",
-                "timeframe": timeframe,
-                "model_path": str(model_path),
-                "feature_columns": feature_cols,
-                "categorical_features": ["group_id"],
-                "device_used": self.device_used,
-                "horizon": horizon,
-                "directional_accuracy": self.training_history.get("directional_accuracy"),
-                "training_history": self.training_history,
-                "training_time": datetime.now().isoformat(),
-            }
-            with open(metadata_path, "wb") as file:
-                pickle.dump(metadata, file)
+        self.model.booster_.save_model(str(model_path))
 
-            self._log(f"✅ LightGBM model saved: {model_path}")
-            self._log(f"✅ Metadata saved: {metadata_path}")
-            return True
-        except Exception as exc:
-            self._log(f"❌ Save error: {exc}")
-            traceback.print_exc()
-            return False
+        metadata = {
+            "model_type": "lightgbm.LGBMRegressor",
+            "timeframe": timeframe,
+            "model_path": str(model_path),
+            "feature_columns": feature_cols,
+            "categorical_features": ["group_id"],
+            "device_used": self.device_used,
+            "horizon": horizon,
+            "directional_accuracy": self.training_history.get("directional_accuracy"),
+            "training_history": self.training_history,
+            "training_time": datetime.now().isoformat(),
+        }
+        with open(metadata_path, "wb") as file:
+            pickle.dump(metadata, file)
+
+        self._log(f"✅ LightGBM model saved: {model_path}")
+        self._log(f"✅ Metadata saved: {metadata_path}")
+        return True
 
 
 class LightGBMTrainerGUI(CTk):
+    INI_PATH = Path(__file__).with_suffix(".ini")
+
     INDICATOR_CONFIG = [
         ("ADX", "enable_adx", True),
         ("ATR", "enable_atr", True),
@@ -904,6 +905,12 @@ class LightGBMTrainerGUI(CTk):
         self.title(Config.APP_TITLE)
         self.geometry(Config.APP_GEOMETRY)
         self.resizable(False, False)
+        self._is_closing = False
+
+        # Hide window while we build the UI and restore saved geometry,
+        # so the user never sees the default position/size flash before
+        # the saved position is applied.
+        self.withdraw()
 
         self.gui_logger = GUILogger()
         self.gui_logger.enable_console_redirect()
@@ -919,9 +926,81 @@ class LightGBMTrainerGUI(CTk):
         self.current_trainer = None
 
         self._create_ui()
+        self._load_state()  # applied while the window is hidden
         self.gui_logger.set_log_widget(self.log_text)
         self.after(500, self.scan_data_source)
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
+
+        # Flush pending geometry/layout work, then reveal the window.
+        self.update_idletasks()
+        self.deiconify()
+
+    def _load_state(self):
+        if not self.INI_PATH.exists():
+            return
+        cp = configparser.ConfigParser()
+        cp.read(str(self.INI_PATH))
+
+        if cp.has_section("window"):
+            geom = cp.get("window", "geometry", fallback="")
+            if geom:
+                self.geometry(geom)
+            else:
+                # Legacy ini stored only x/y - fall back to size only.
+                x = cp.get("window", "x", fallback="")
+                y = cp.get("window", "y", fallback="")
+                if x and y:
+                    self.geometry(f"{Config.APP_GEOMETRY}+{x}+{y}")
+
+        if cp.has_section("paths"):
+            csv = cp.get("paths", "csv_folder", fallback="")
+            model = cp.get("paths", "model_folder", fallback="")
+            if csv:
+                self.csv_path_var.set(csv)
+                self.csv_folder = Path(csv)
+            if model:
+                self.model_path_var.set(model)
+                self.model_folder = Path(model)
+
+        if cp.has_section("params"):
+            self.horizon.set(cp.get("params", "horizon", fallback=str(Config.DEFAULT_HORIZON)))
+            self.iterations.set(cp.get("params", "iterations", fallback=str(Config.DEFAULT_ITERATIONS)))
+            self.learning_rate.set(cp.get("params", "learning_rate", fallback=str(Config.DEFAULT_LEARNING_RATE)))
+            self.max_depth.set(cp.get("params", "max_depth", fallback=str(Config.DEFAULT_MAX_DEPTH)))
+            self.auto_tune_var.set(cp.getboolean("params", "auto_tune", fallback=True))
+
+        if cp.has_section("features"):
+            self.feature_cols_var.set(cp.get("features", "base_features", fallback="time,open,high,low,close,volume"))
+
+        if cp.has_section("timeframes"):
+            for tf in Config.TIMEFRAMES:
+                if tf in self.tf_vars:
+                    self.tf_vars[tf].set(cp.getboolean("timeframes", tf, fallback=True))
+
+        if cp.has_section("indicators"):
+            for var_name in self.indicator_vars:
+                self.indicator_vars[var_name].set(cp.getboolean("indicators", var_name, fallback=True))
+
+    def _save_state(self):
+        cp = configparser.ConfigParser()
+        # Store wm_geometry() directly - frame-relative, round-trips exactly
+        # through self.geometry(). Avoids the +/-titlebar drift you get when
+        # mixing winfo_x()/winfo_y() (client coords) with geometry() (frame).
+        cp["window"] = {"geometry": self.wm_geometry()}
+        cp["paths"] = {"csv_folder": str(self.csv_path_var.get()), "model_folder": str(self.model_path_var.get())}
+        cp["params"] = {
+            "horizon": self.horizon.get(),
+            "iterations": self.iterations.get(),
+            "learning_rate": self.learning_rate.get(),
+            "max_depth": self.max_depth.get(),
+            "auto_tune": str(self.auto_tune_var.get()),
+        }
+        cp["features"] = {"base_features": self.feature_cols_var.get()}
+        cp["timeframes"] = {tf: str(var.get()) for tf, var in self.tf_vars.items()}
+        cp["indicators"] = {k: str(v.get()) for k, v in self.indicator_vars.items()}
+
+        with open(self.INI_PATH, "w") as f:
+            cp.write(f)
 
     def _create_ui(self):
         main_frame = CTkFrame(self, fg_color="transparent")
@@ -930,7 +1009,7 @@ class LightGBMTrainerGUI(CTk):
         title_frame = CTkFrame(main_frame, corner_radius=8)
         title_frame.pack(fill="x", pady=(0, 5))
 
-        CTkLabel(title_frame, text="Copyright Su Nie | BSD-3C License | https://github.com/can87683", font=("Ubuntu", 16), text_color="yellow").pack(pady=(0, 4))
+        CTkLabel(title_frame, text="Copyright Su Nie | Copyright Su Nie | BSD-3C License | https://github.com/can87683 | https://github.com/can87683", font=("Ubuntu", 16), text_color="yellow").pack(pady=(0, 4))
 
         CTkLabel(title_frame, text="🎯 LightGBM Model Trainer (per timeframe)",
                  font=("Ubuntu", 20, "bold")).pack(pady=6)
@@ -1093,6 +1172,8 @@ class LightGBMTrainerGUI(CTk):
         self.log_text.pack(fill="both", expand=True, padx=10, pady=4)
 
     def update_status(self, message):
+        if self._is_closing:
+            return
         self.status_text.configure(state="normal")
         self.status_text.delete("1.0", "end")
         self.status_text.insert("1.0", message)
@@ -1184,7 +1265,7 @@ class LightGBMTrainerGUI(CTk):
                 results = {}
 
                 for timeframe in selected_timeframes:
-                    if self.stop_flag:
+                    if self.stop_flag or self._is_closing:
                         self.gui_logger.log("⏹️ Training stopped by user", "warning")
                         break
 
@@ -1254,8 +1335,9 @@ class LightGBMTrainerGUI(CTk):
             finally:
                 self.is_training = False
                 self.current_trainer = None
-                self.train_btn.configure(state="normal")
-                self.stop_btn.configure(state="disabled")
+                if not self._is_closing:
+                    self.train_btn.configure(state="normal")
+                    self.stop_btn.configure(state="disabled")
 
         threading.Thread(target=training_task, daemon=True).start()
 
@@ -1266,28 +1348,42 @@ class LightGBMTrainerGUI(CTk):
         self.gui_logger.log("⏹️ Stopping training...", "warning")
 
     def _on_closing(self):
-        self.gui_logger.disable_console_redirect()
-        if self.is_training:
-            result = messagebox.askyesno(
-                "Training in Progress",
-                "Training is currently running.\n\nDo you want to stop training and quit?",
-                icon='warning',
-            )
-            if result:
-                self.stop_flag = True
-                if self.current_trainer is not None:
-                    self.current_trainer.stop_training()
-                self.after(100, self.destroy)
-        else:
-            result = messagebox.askyesno("Quit", "Do you want to quit AI Predict Train (LightGBM)?")
-            if result:
-                self.destroy()
+        if self._is_closing:
+            return
+        self._is_closing = True
+        try:
+            self._save_state()
+        except Exception:
+            pass
 
+        def do_exit():
+            self.gui_logger.disable_console_redirect()
+            self.destroy()
 
-def main():
-    app = LightGBMTrainerGUI()
-    app.mainloop()
+        def confirm_exit():
+            if self.is_training:
+                result = messagebox.askyesno(
+                    "Training in Progress",
+                    "Training is currently running.\n\nDo you want to stop training and quit?",
+                    icon='warning',
+                )
+                if result:
+                    self.stop_flag = True
+                    if self.current_trainer is not None:
+                        self.current_trainer.stop_training()
+                    self.after(200, do_exit)
+                else:
+                    self._is_closing = False
+            else:
+                result = messagebox.askyesno("Quit", "Do you want to quit AI Predict Train (LightGBM)?")
+                if result:
+                    do_exit()
+                else:
+                    self._is_closing = False
+
+        self.after(0, confirm_exit)
 
 
 if __name__ == "__main__":
-    main()
+    app = LightGBMTrainerGUI()
+    app.mainloop()

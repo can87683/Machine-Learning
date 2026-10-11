@@ -1,6 +1,10 @@
+"""
+customtkinter numpy pandas psutil setproctitle torch
+"""
 #!/usr/bin/env python3
 # ai_predict_train_tcn.py
 # Copyright Su Nie | BSD-3C License | https://github.com/can87683
+
 
 import setproctitle
 setproctitle.setproctitle("ai_predict_train_tcn_ctk")
@@ -11,82 +15,60 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 import threading
 import subprocess
+import configparser
 import copy
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import pickle
-import json
 import gc
 import psutil
 from datetime import datetime
-import traceback
 import sys
 import os
-import time
-import warnings
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-
-try:
-    # torch >= 1.13 (preferred, non-deprecated location)
-    from torch.nn.utils.parametrizations import weight_norm
-except ImportError:
-    # older torch releases
-    from torch.nn.utils import weight_norm
-
-# Suppress FutureWarnings
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
+from torch.nn.utils.parametrizations import weight_norm
 
 
 class Config:
-    """Central configuration for all settings"""
-
-    # Paths
     HOME = Path.home()
     MODEL_DIR = HOME / "ai_model_ml"
     DATASET_DIR = HOME / "mt5_data"
 
-    # Data settings
     MAX_ROWS_PER_SYMBOL = 20000
     MAX_DATASET_ROWS = 200000
-    DEFAULT_FEATURES = ['time', 'open', 'high', 'low', 'close', 'volume']
+    DEFAULT_FEATURES = ['time', 'open', 'high', 'low', 'close', 'tick_volume']
 
-    # Model settings (TCN)
     DEFAULT_HORIZON = 10
-    DEFAULT_SEQUENCE_LENGTH = 30        # lookback window fed to the TCN
+    DEFAULT_SEQUENCE_LENGTH = 30
     DEFAULT_EPOCHS = 100
     DEFAULT_LEARNING_RATE = 0.001
-    DEFAULT_CHANNELS = [32, 32, 32, 32]  # one TemporalBlock per entry; dilation doubles each block (1,2,4,8)
-    DEFAULT_KERNEL_SIZE = 3               # receptive field with these defaults: 1 + 2*(k-1)*sum(dilations) = 61
+    DEFAULT_CHANNELS = [32, 32, 32, 32]
+    DEFAULT_KERNEL_SIZE = 3
     DEFAULT_DROPOUT = 0.2
-    DEFAULT_EMBEDDING_DIM = 8           # per-symbol embedding size
+    DEFAULT_EMBEDDING_DIM = 8
     DEFAULT_BATCH_SIZE = 128
     GRADIENT_CLIP_NORM = 5.0
 
-    # Training settings
-    EARLY_STOPPING_PATIENCE = 10        # epochs without val improvement
-    VALIDATION_FRACTION = 0.15          # last X% of each symbol's series, chronologically
+    EARLY_STOPPING_PATIENCE = 10
+    VALIDATION_FRACTION = 0.15
 
-    # Memory settings
     MEMORY_WARNING_THRESHOLD_GB = 0.5
 
-    # Timeframes -> one independent model is trained per timeframe
     TIMEFRAMES = ['M5', 'M15', 'H1', 'H4', 'D1', 'W1']
 
-    # Output naming
     MODEL_PREFIX = "ai_predict_tcn"
-    MODEL_EXT = ".pt"            # PyTorch state dict
+    MODEL_EXT = ".pt"
     METADATA_EXT = ".pkl"
 
-    # UI settings
     APP_TITLE = "🚀 TCN Model Trainer"
     APP_GEOMETRY = "640x1050"
     THEME = "dark"
     COLOR_THEME = "dark-blue"
+
+    SEED = 42
 
     @classmethod
     def ensure_directories(cls):
@@ -96,49 +78,51 @@ class Config:
 
 Config.ensure_directories()
 
-# ===== CTK Theme Settings =====
 ctk.set_appearance_mode(Config.THEME)
 ctk.set_default_color_theme(Config.COLOR_THEME)
 
-# ===== Constants =====
 HOME = Config.HOME
 MODEL_DIR = Config.MODEL_DIR
 DATASET_DIR = Config.DATASET_DIR
 
-torch.manual_seed(42)
+torch.manual_seed(Config.SEED)
 
 
 class GPUManager:
-    def __init__(self, verbose=True):
+    def __init__(self, verbose=True, log_callback=None):
         self.verbose = verbose
+        self.log_callback = log_callback
         self.gpu_available = False
         self.gpu_name = None
+        self.gpu_memory_gb = 0.0
         self._detect_gpu()
-
         self.torch_cuda_available = torch.cuda.is_available()
         if self.torch_cuda_available:
             torch.backends.cudnn.benchmark = True
 
     def _log(self, message):
-        if self.verbose:
+        if self.log_callback:
+            self.log_callback(message)
+        elif self.verbose:
             print(f"[GPUManager] {message}")
 
     def _detect_gpu(self):
-        try:
-            result = subprocess.run(
-                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-                capture_output=True,
-                text=True,
-                timeout=3,
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            self.gpu_available = True
+            self.gpu_name = result.stdout.strip().splitlines()[0]
+            mem_result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=3
             )
-            if result.returncode == 0 and result.stdout.strip():
-                self.gpu_available = True
-                self.gpu_name = result.stdout.strip().splitlines()[0]
-                self._log(f"✅ GPU detected: {self.gpu_name}")
-            else:
-                self._log("ℹ️ No GPU detected, using CPU")
-        except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
-            self.gpu_available = False
+            self.gpu_memory_gb = float(mem_result.stdout.strip().split()[0]) / 1024.0
+            self._log(f"✅ GPU detected: {self.gpu_name} ({self.gpu_memory_gb:.2f} GB)")
+        else:
             self._log("ℹ️ No GPU detected, using CPU")
 
     def preferred_devices(self):
@@ -146,52 +130,74 @@ class GPUManager:
             return [torch.device("cuda"), torch.device("cpu")]
         return [torch.device("cpu")]
 
+    def log_system_info(self):
+        self._log("=" * 60)
+        self._log("🖥️ System & Library Information")
+        self._log("=" * 60)
+        self._log(f"🐍 Python: {sys.version.split()[0]}")
+        self._log(f"🔥 PyTorch: {torch.__version__}")
+        self._log(f"🔌 CUDA Available: {torch.cuda.is_available()}")
+        if torch.cuda.is_available():
+            self._log(f"🎮 GPU Device: {torch.cuda.get_device_name(0)}")
+            self._log(f"💾 GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        else:
+            self._log("⚠️ No usable GPU for PyTorch. Will use CPU.")
+        self._log("=" * 60)
+
 
 class UsageRow:
-    def __init__(self, parent):
-        self.parent = parent
-        self.usage_frame = None
-        self.usage_label = None
-        self._create_usage_row()
+    # --- Display constants ---
+    FRAME_HEIGHT = 40
+    FRAME_CORNER_RADIUS = 5
+    FRAME_PADY = (0, 10)
 
-    def _create_usage_row(self):
-        self.usage_frame = CTkFrame(self.parent, height=40, corner_radius=5)
-        self.usage_frame.pack(fill="x", pady=(0, 10))
+    FONT = ("Ubuntu Mono", 20)
+    TEXT_COLOR = "Lime"
+    PLACEHOLDER_TEXT = "Loading system usage..."
+
+    LABEL_PADX = 10
+    LABEL_PADY = 5
+
+    REFRESH_MS = 2000
+    CPU_SAMPLE_INTERVAL = 0.5
+
+    def __init__(self, parent):
+        self.usage_frame = CTkFrame(
+            parent,
+            height=self.FRAME_HEIGHT,
+            corner_radius=self.FRAME_CORNER_RADIUS,
+        )
+        self.usage_frame.pack(fill="x", pady=self.FRAME_PADY)
 
         self.usage_label = CTkLabel(
             self.usage_frame,
-            text="Loading system usage...",
-            font=("Ubuntu Mono", 20),
-            text_color="Lime"
+            text=self.PLACEHOLDER_TEXT,
+            font=self.FONT,
+            text_color=self.TEXT_COLOR,
         )
-        self.usage_label.pack(expand=True, fill="x", padx=10, pady=5)
-
+        self.usage_label.pack(
+            expand=True, fill="x",
+            padx=self.LABEL_PADX, pady=self.LABEL_PADY,
+        )
         self._update_usage()
 
     def _update_usage(self):
+        cpu = psutil.cpu_percent(interval=self.CPU_SAMPLE_INTERVAL)
+        dram = psutil.virtual_memory().percent
+        gpu_percent = vram_percent = 0
         try:
-            cpu = psutil.cpu_percent(interval=0.5)
-            dram = psutil.virtual_memory().percent
-
-            gpu_percent = 0
-            vram_percent = 0
-            try:
-                import GPUtil
-                gpus = GPUtil.getGPUs()
-                if gpus:
-                    gpu = gpus[0]
-                    gpu_percent = gpu.load * 100
-                    vram_percent = gpu.memoryUtil * 100
-            except (ImportError, Exception):
-                pass
-
-            self.usage_label.configure(
-                text=f"CPU: {cpu:.1f}%  DRAM: {dram:.1f}%  GPU: {gpu_percent:.1f}%  VRAM: {vram_percent:.1f}%"
-            )
-        except Exception:
-            self.usage_label.configure(text="⚠️ System monitoring unavailable")
-
-        self.usage_label.after(2000, self._update_usage)
+            import GPUtil
+            gpus = GPUtil.getGPUs()
+            if gpus:
+                gpu_percent = gpus[0].load * 100
+                vram_percent = gpus[0].memoryUtil * 100
+        except ImportError:
+            pass
+        self.usage_label.configure(
+            text=f"CPU: {cpu:.1f}%  DRAM: {dram:.1f}%  "
+                 f"GPU: {gpu_percent:.1f}%  VRAM: {vram_percent:.1f}%"
+        )
+        self.usage_label.after(self.REFRESH_MS, self._update_usage)
 
 
 class ConsoleLogger:
@@ -231,8 +237,6 @@ class MemoryOptimizer:
 
 
 class FeatureEngineer:
-    """Extract time-based and comprehensive technical features"""
-
     @staticmethod
     def add_time_features(df):
         if 'time' not in df.columns:
@@ -288,8 +292,8 @@ class FeatureEngineer:
 
     @staticmethod
     def _add_cmf(df, period=20):
-        mfv = ((df['close'] - df['low']) - (df['high'] - df['close'])) / (df['high'] - df['low']).replace(0, np.nan) * df['volume']
-        df['cmf'] = mfv.rolling(period).sum() / df['volume'].rolling(period).sum().replace(0, np.nan)
+        mfv = ((df['close'] - df['low']) - (df['high'] - df['close'])) / (df['high'] - df['low']).replace(0, np.nan) * df['tick_volume']
+        df['cmf'] = mfv.rolling(period).sum() / df['tick_volume'].rolling(period).sum().replace(0, np.nan)
         return df
 
     @staticmethod
@@ -313,7 +317,7 @@ class FeatureEngineer:
 
     @staticmethod
     def _add_force_index(df, period=13):
-        fi = df['close'].diff() * df['volume']
+        fi = df['close'].diff() * df['tick_volume']
         df['force_index'] = fi.ewm(span=period, adjust=False).mean()
         return df
 
@@ -331,7 +335,7 @@ class FeatureEngineer:
     @staticmethod
     def _add_mfi(df, period=14):
         typical_price = (df['high'] + df['low'] + df['close']) / 3
-        raw_money_flow = typical_price * df['volume']
+        raw_money_flow = typical_price * df['tick_volume']
         positive_flow = raw_money_flow.where(typical_price > typical_price.shift(1), 0.0)
         negative_flow = raw_money_flow.where(typical_price < typical_price.shift(1), 0.0)
         positive_sum = positive_flow.rolling(period).sum()
@@ -343,8 +347,8 @@ class FeatureEngineer:
     @staticmethod
     def _add_obv(df):
         price_direction = np.sign(df['close'].diff()).fillna(0)
-        df['obv'] = (price_direction * df['volume']).cumsum()
-        rolling_vol = df['volume'].rolling(20).sum().replace(0, np.nan)
+        df['obv'] = (price_direction * df['tick_volume']).cumsum()
+        rolling_vol = df['tick_volume'].rolling(20).sum().replace(0, np.nan)
         df['obv_slope_5'] = df['obv'].diff(5) / rolling_vol
         return df
 
@@ -392,8 +396,8 @@ class FeatureEngineer:
     @staticmethod
     def _add_rvwap(df, period=20):
         typical_price = (df['high'] + df['low'] + df['close']) / 3
-        rolling_tp_vol = (typical_price * df['volume']).rolling(period).sum()
-        rolling_vol = df['volume'].rolling(period).sum().replace(0, np.nan)
+        rolling_tp_vol = (typical_price * df['tick_volume']).rolling(period).sum()
+        rolling_vol = df['tick_volume'].rolling(period).sum().replace(0, np.nan)
         df['rvwap'] = rolling_tp_vol / rolling_vol
         df['close_vs_rvwap'] = df['close'] / df['rvwap'] - 1
         return df
@@ -410,12 +414,12 @@ class FeatureEngineer:
 
     @staticmethod
     def _add_volume_metrics(df):
-        volume_ma_20 = df['volume'].rolling(20).mean()
-        volume_std_20 = df['volume'].rolling(20).std()
-        df['volume_ratio_20'] = df['volume'] / volume_ma_20.replace(0, np.nan)
-        df['volume_zscore_20'] = (df['volume'] - volume_ma_20) / volume_std_20.replace(0, np.nan)
-        df['return_x_volume_1'] = df['close'].pct_change() * df['volume']
-        dollar_volume = (df['close'] * df['volume']).replace(0, np.nan)
+        volume_ma_20 = df['tick_volume'].rolling(20).mean()
+        volume_std_20 = df['tick_volume'].rolling(20).std()
+        df['volume_ratio_20'] = df['tick_volume'] / volume_ma_20.replace(0, np.nan)
+        df['volume_zscore_20'] = (df['tick_volume'] - volume_ma_20) / volume_std_20.replace(0, np.nan)
+        df['return_x_volume_1'] = df['close'].pct_change() * df['tick_volume']
+        dollar_volume = (df['close'] * df['tick_volume']).replace(0, np.nan)
         df['amihud_illiquidity_20'] = (df['close'].pct_change().abs() / dollar_volume).rolling(20).mean()
         return df
 
@@ -431,30 +435,23 @@ class GUILogger:
     def set_log_widget(self, widget):
         self.log_widget = widget
         self.ready = True
-        self.log_widget.configure(font=("Ubuntu Mono", 11))
+        self.log_widget.configure(font=("Ubuntu Mono", 12))
         for msg, level in self.messages:
             self._write_to_widget(msg, level)
         self.messages.clear()
 
     def _write_to_widget(self, message, level):
-        if self.log_widget:
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            log_entry = f"[{timestamp}] {message}\n"
-            try:
-                self.log_widget.insert("end", log_entry)
-                self.log_widget.see("end")
-                self.log_widget.update_idletasks()
-            except Exception:
-                print(log_entry, flush=True)
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_entry = f"[{timestamp}] {message}\n"
+        self.log_widget.insert("end", log_entry)
+        self.log_widget.see("end")
+        self.log_widget.update_idletasks()
 
     def log(self, message, level="info"):
         timestamp = datetime.now().strftime("%H:%M:%S")
         console_entry = f"[{timestamp}] [{level.upper()}] {message}"
-        try:
-            self._original_stdout.write(console_entry + "\n")
-            self._original_stdout.flush()
-        except Exception:
-            print(console_entry, flush=True)
+        self._original_stdout.write(console_entry + "\n")
+        self._original_stdout.flush()
         if self.ready and self.log_widget:
             self._write_to_widget(message, level)
         else:
@@ -475,6 +472,7 @@ class StreamingDataPreparer:
         self.feature_cols = []
         self.categorical_features = ["group_id"]
         self.target_column = "target"
+        self.group_id_categories = []
 
         self.enable_atr = True
         self.enable_bollinger = True
@@ -505,27 +503,32 @@ class StreamingDataPreparer:
 
     def load_csv_data(self, symbol, timeframe, csv_folder):
         csv_file = Path(csv_folder) / symbol / f"{symbol}_{timeframe}.csv"
-        if not csv_file.exists(): return None
-        try:
-            df = pd.read_csv(csv_file)
-            if "time" not in df.columns: return None
-            if pd.api.types.is_numeric_dtype(df["time"]):
-                df["time"] = pd.to_datetime(df["time"], unit="s")
-            else:
-                df["time"] = pd.to_datetime(df["time"])
-            df = df.sort_values("time").drop_duplicates("time").reset_index(drop=True)
-            return df
-        except Exception as exc:
-            self._log(f"❌ Error loading {csv_file}: {exc}")
+        if not csv_file.exists():
             return None
+
+        df = pd.read_csv(csv_file)
+        if "time" not in df.columns:
+            self._log(f"⚠️ Missing time column: {csv_file}")
+            return None
+
+        if pd.api.types.is_numeric_dtype(df["time"]):
+            df["time"] = pd.to_datetime(df["time"], unit="s")
+        else:
+            df["time"] = pd.to_datetime(df["time"])
+
+        df = df.sort_values("time").drop_duplicates("time").reset_index(drop=True)
+        return df
 
     def scan_folder(self, csv_folder):
         csv_folder = Path(csv_folder)
-        if not csv_folder.exists(): return [], []
+        if not csv_folder.exists():
+            return [], []
+
         symbols = []
         all_timeframes = set()
         for symbol_dir in sorted(csv_folder.iterdir()):
-            if not symbol_dir.is_dir(): continue
+            if not symbol_dir.is_dir():
+                continue
             symbol = symbol_dir.name
             found_timeframes = []
             for timeframe in Config.TIMEFRAMES:
@@ -539,7 +542,8 @@ class StreamingDataPreparer:
         return symbols, sorted(all_timeframes)
 
     def _prepare_single_series(self, df, symbol, horizon, requested_features):
-        if df is None or len(df) < 100: return None
+        if df is None or len(df) < 100:
+            return None
         df = df.copy()
         if len(df) > Config.MAX_ROWS_PER_SYMBOL:
             df = df.iloc[-Config.MAX_ROWS_PER_SYMBOL:].copy()
@@ -611,19 +615,30 @@ class StreamingDataPreparer:
         candidate_features = list(dict.fromkeys(requested_features + engineered_features))
         available_features = [c for c in candidate_features if c in df.columns]
 
-        required_columns = ["open", "high", "low", "close", "volume"]
+        required_columns = ["open", "high", "low", "close", "tick_volume"]
         for column in required_columns:
             if column in df.columns and column not in available_features:
                 available_features.append(column)
 
-        if "close" not in df.columns: return None
-        if not available_features: return None
+        if "close" not in df.columns:
+            self._log(f"⚠️ Skipping {symbol}: close column unavailable")
+            return None
+        if not available_features:
+            self._log(f"⚠️ Skipping {symbol}: no usable features")
+            return None
 
-        df[available_features] = df[available_features].replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0.0)
+        df[available_features] = (
+            df[available_features]
+            .replace([np.inf, -np.inf], np.nan)
+            .ffill()
+            .bfill()
+            .fillna(0.0)
+        )
+
         df[self.target_column] = df["close"].shift(-horizon)
         df = df.dropna(subset=[self.target_column]).copy()
-
-        if len(df) < 50: return None
+        if len(df) < 50:
+            return None
 
         df["group_id"] = str(symbol)
         df["time_idx"] = np.arange(len(df), dtype=np.int64)
@@ -643,7 +658,8 @@ class StreamingDataPreparer:
         for symbol in symbols_with_tf:
             df = self.load_csv_data(symbol, timeframe, csv_folder)
             prepared = self._prepare_single_series(df, symbol, horizon, feature_cols)
-            if prepared is None: continue
+            if prepared is None:
+                continue
             prepared_df, available_features = prepared
             frames.append(prepared_df)
             all_features.extend(available_features)
@@ -654,11 +670,27 @@ class StreamingDataPreparer:
 
         all_features = list(dict.fromkeys(all_features))
         result = pd.concat(frames, ignore_index=True, sort=False)
-        for column in all_features:
-            if column not in result.columns: result[column] = 0.0
 
-        result[all_features] = result[all_features].replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0.0).astype(np.float32)
-        result[self.target_column] = result[self.target_column].replace([np.inf, -np.inf], np.nan).ffill().bfill().astype(np.float32)
+        for column in all_features:
+            if column not in result.columns:
+                result[column] = 0.0
+
+        result[all_features] = (
+            result[all_features]
+            .replace([np.inf, -np.inf], np.nan)
+            .ffill()
+            .bfill()
+            .fillna(0.0)
+            .astype(np.float32)
+        )
+
+        result[self.target_column] = (
+            result[self.target_column]
+            .replace([np.inf, -np.inf], np.nan)
+            .ffill()
+            .bfill()
+            .astype(np.float32)
+        )
 
         result["group_id"] = result["group_id"].astype("category")
         self.group_id_categories = list(result["group_id"].cat.categories)
@@ -671,14 +703,17 @@ class StreamingDataPreparer:
         return result
 
 
-class SequenceDataset(Dataset):
+class SequenceDataset(torch.utils.data.Dataset):
     def __init__(self, X, group_ids, y):
         self.X = torch.from_numpy(X)
         self.group_ids = torch.from_numpy(group_ids).long()
         self.y = torch.from_numpy(y)
 
-    def __len__(self): return len(self.y)
-    def __getitem__(self, idx): return self.X[idx], self.group_ids[idx], self.y[idx]
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.group_ids[idx], self.y[idx]
 
 
 class Chomp1d(nn.Module):
@@ -787,7 +822,8 @@ class StreamingTCNTrainer:
         self._log(f"🚀 TCN trainer{tf_label} initialized. Device attempt order: {preferred.upper()}")
 
     def _log(self, message):
-        if self.log_callback: self.log_callback(message)
+        if self.log_callback:
+            self.log_callback(message)
 
     def stop_training(self):
         self.stop_flag = True
@@ -797,10 +833,17 @@ class StreamingTCNTrainer:
         train_parts, val_parts = [], []
         for _, group in data.groupby("group_id"):
             group = group.sort_values("time_idx")
-            n_val = max(1, int(len(group) * Config.VALIDATION_FRACTION))
+            n = len(group)
+            if n < 5:
+                train_parts.append(group)
+                continue
+            n_val = max(1, int(n * Config.VALIDATION_FRACTION))
+            n_val = min(n_val, n - 1)
             train_parts.append(group.iloc[:-n_val])
             val_parts.append(group.iloc[-n_val:])
-        return pd.concat(train_parts, ignore_index=True), pd.concat(val_parts, ignore_index=True)
+        train_df = pd.concat(train_parts, ignore_index=True)
+        val_df = pd.concat(val_parts, ignore_index=True)
+        return train_df, val_df
 
     def _fit_scalers(self, train_df, feature_cols):
         feature_mean = train_df[feature_cols].mean().to_numpy(dtype=np.float64)
@@ -831,7 +874,8 @@ class StreamingTCNTrainer:
         raw_close = combined["raw_close"].to_numpy(dtype=np.float32) if has_raw else None
         raw_target = combined["raw_target"].to_numpy(dtype=np.float32) if has_raw else None
         n = len(combined)
-        if n < seq_len: return None
+        if n < seq_len:
+            return None
 
         first_target_idx = max(seq_len - 1, start_offset)
         X_list, y_list, raw_close_list, raw_target_list = [], [], [], []
@@ -842,7 +886,8 @@ class StreamingTCNTrainer:
                 raw_close_list.append(raw_close[i])
                 raw_target_list.append(raw_target[i])
 
-        if not X_list: return None
+        if not X_list:
+            return None
         X = np.stack(X_list).astype(np.float32)
         y = np.array(y_list, dtype=np.float32)
         raw_close_arr = np.array(raw_close_list, dtype=np.float32) if has_raw else None
@@ -859,24 +904,37 @@ class StreamingTCNTrainer:
 
         for group_id, group_df in train_groups.items():
             built = self._build_sequences_for_group(group_df.sort_values("time_idx"), feature_cols, seq_len)
-            if built is None: continue
+            if built is None:
+                continue
             X, y, _, _ = built
-            X_train_list.append(X); y_train_list.append(y); g_train_list.append(np.full(len(y), group_id, dtype=np.int64))
+            X_train_list.append(X)
+            y_train_list.append(y)
+            g_train_list.append(np.full(len(y), group_id, dtype=np.int64))
 
         for group_id, group_df in val_groups.items():
             context = train_groups.get(group_id)
             context_tail = context.sort_values("time_idx").iloc[-(seq_len - 1):] if context is not None else None
             built = self._build_sequences_for_group(group_df.sort_values("time_idx"), feature_cols, seq_len, context_df=context_tail)
-            if built is None: continue
+            if built is None:
+                continue
             X, y, raw_close, raw_target = built
-            X_val_list.append(X); y_val_list.append(y); g_val_list.append(np.full(len(y), group_id, dtype=np.int64))
-            if raw_close is not None: raw_close_val_list.append(raw_close); raw_target_val_list.append(raw_target)
+            X_val_list.append(X)
+            y_val_list.append(y)
+            g_val_list.append(np.full(len(y), group_id, dtype=np.int64))
+            if raw_close is not None:
+                raw_close_val_list.append(raw_close)
+                raw_target_val_list.append(raw_target)
 
-        if not X_train_list: raise ValueError("No training sequences could be built")
-        X_train, y_train, g_train = np.concatenate(X_train_list), np.concatenate(y_train_list), np.concatenate(g_train_list)
+        if not X_train_list:
+            raise ValueError("No training sequences could be built")
+        X_train = np.concatenate(X_train_list)
+        y_train = np.concatenate(y_train_list)
+        g_train = np.concatenate(g_train_list)
 
         if X_val_list:
-            X_val, y_val, g_val = np.concatenate(X_val_list), np.concatenate(y_val_list), np.concatenate(g_val_list)
+            X_val = np.concatenate(X_val_list)
+            y_val = np.concatenate(y_val_list)
+            g_val = np.concatenate(g_val_list)
             raw_close_val = np.concatenate(raw_close_val_list) if raw_close_val_list else None
             raw_target_val = np.concatenate(raw_target_val_list) if raw_target_val_list else None
         else:
@@ -885,153 +943,232 @@ class StreamingTCNTrainer:
         return X_train, y_train, g_train, X_val, y_val, g_val, raw_close_val, raw_target_val
 
     def _compute_directional_accuracy(self, model, X_val, g_val, raw_close_val, raw_target_val, device, scaler_state):
-        try:
-            if raw_close_val is None or raw_target_val is None or len(X_val) == 0: return None
-            model.eval()
-            preds_list = []
-            with torch.no_grad():
-                for start in range(0, len(X_val), self.batch_size):
-                    X_batch = torch.from_numpy(X_val[start:start+self.batch_size]).to(device)
-                    g_batch = torch.from_numpy(g_val[start:start+self.batch_size]).long().to(device)
-                    preds_list.append(model(X_batch, g_batch).cpu().numpy())
+        if raw_close_val is None or raw_target_val is None or len(X_val) == 0:
+            return None
+        model.eval()
+        preds_list = []
+        with torch.no_grad():
+            for start in range(0, len(X_val), self.batch_size):
+                X_batch = torch.from_numpy(X_val[start:start + self.batch_size]).to(device)
+                g_batch = torch.from_numpy(g_val[start:start + self.batch_size]).long().to(device)
+                preds_list.append(model(X_batch, g_batch).cpu().numpy())
 
-            median_price = np.concatenate(preds_list, axis=0) * scaler_state["target_std"] + scaler_state["target_mean"]
-            actual_direction = np.sign(raw_target_val - raw_close_val)
-            predicted_direction = np.sign(median_price - raw_close_val)
-            valid_mask = actual_direction != 0
-            if valid_mask.sum() == 0: return None
-            return float(((actual_direction == predicted_direction) & valid_mask).sum() / valid_mask.sum())
-        except Exception: return None
-        finally: model.train()
-
-    def train_single_timeframe(self, data, feature_cols, timeframe, num_groups, epochs=100, learning_rate=0.001,
-                               sequence_length=30, channels=None, kernel_size=3, dropout=0.2, batch_size=128,
-                               status_callback=None, **kwargs):
-        try:
-            self.stop_flag = False
-            self.timeframe = timeframe
-            self.batch_size = batch_size
-            self.kernel_size = kernel_size
-            self.dropout = dropout
-            self.sequence_length = sequence_length
-            channels = channels or self.channels
-            self.channels = list(channels)
-
-            if len(data) == 0: raise ValueError("Prepared dataframe is empty")
-            train_df, val_df = self._chronological_split(data)
-            if len(train_df) == 0: raise ValueError("Train split produced an empty set")
-
-            scaler_state = self._fit_scalers(train_df, feature_cols)
-            train_df = self._apply_scalers(train_df, feature_cols, scaler_state)
-            val_df = self._apply_scalers(val_df, feature_cols, scaler_state) if len(val_df) else val_df
-
-            X_train, y_train, g_train, X_val, y_val, g_val, raw_close_val, raw_target_val = self._build_sequence_arrays(
-                train_df, val_df, feature_cols, sequence_length)
-
-            self._log(f"📊 [{timeframe}] Training sequences: {len(y_train):,}, Val: {len(y_val):,}")
-            train_loader = DataLoader(SequenceDataset(X_train, g_train, y_train), batch_size=batch_size, shuffle=True)
-            val_loader = DataLoader(SequenceDataset(X_val, g_val, y_val), batch_size=batch_size, shuffle=False) if len(y_val) > 0 else None
-
-            last_error = None
-            trained_ok = False
-            for device in self.gpu_manager.preferred_devices():
-                if self.stop_flag: break
-                try:
-                    trained_ok = self._run_training_loop(train_loader, val_loader, len(feature_cols), num_groups, self.channels, kernel_size, dropout, self.embedding_dim, epochs, learning_rate, device, timeframe, status_callback)
-                    self.device_used = str(device)
-                    break
-                except RuntimeError as exc:
-                    last_error = exc
-                    MemoryOptimizer.clear_cache()
-
-            if not trained_ok: raise last_error or RuntimeError("No device succeeded")
-            self.scaler_state = scaler_state
-            self.is_trained = True
-            self.training_history["directional_accuracy"] = self._compute_directional_accuracy(self.model, X_val, g_val, raw_close_val, raw_target_val, torch.device(self.device_used), scaler_state)
-            if self.training_history["directional_accuracy"] is not None:
-                self._log(f"🎯 [{timeframe}] Directional accuracy: {self.training_history['directional_accuracy']*100:.1f}%")
-            return True
-        except Exception as exc:
-            self._log(f"❌ [{timeframe}] Training error: {exc}")
-            traceback.print_exc()
-            return False
+        predicted_price = np.concatenate(preds_list, axis=0) * scaler_state["target_std"] + scaler_state["target_mean"]
+        actual_direction = np.sign(raw_target_val - raw_close_val)
+        predicted_direction = np.sign(predicted_price - raw_close_val)
+        valid_mask = actual_direction != 0
+        if valid_mask.sum() == 0:
+            return None
+        model.train()
+        return float(((actual_direction == predicted_direction) & valid_mask).sum() / valid_mask.sum())
 
     def _run_training_loop(self, train_loader, val_loader, num_features, num_groups, channels, kernel_size, dropout, embedding_dim, epochs, learning_rate, device, timeframe, status_callback):
         model = TCNRegressor(num_features, channels, kernel_size, dropout, num_groups, embedding_dim).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
         loss_fn = nn.MSELoss()
-        best_val_loss, best_state, best_epoch, patience_counter = float("inf"), copy.deepcopy(model.state_dict()), 0, 0
+        best_val_loss = float("inf")
+        best_state = copy.deepcopy(model.state_dict())
+        best_epoch = 0
+        patience_counter = 0
+        epoch = 0
 
         for epoch in range(1, epochs + 1):
-            if self.stop_flag: break
+            if self.stop_flag:
+                break
             model.train()
-            train_loss_sum, train_count = 0.0, 0
+            train_loss_sum = 0.0
+            train_count = 0
             for X_batch, g_batch, y_batch in train_loader:
-                X_batch, g_batch, y_batch = X_batch.to(device), g_batch.to(device), y_batch.to(device)
+                X_batch = X_batch.to(device)
+                g_batch = g_batch.to(device)
+                y_batch = y_batch.to(device)
                 optimizer.zero_grad()
                 loss = loss_fn(model(X_batch, g_batch), y_batch)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), Config.GRADIENT_CLIP_NORM)
                 optimizer.step()
-                train_loss_sum += loss.item() * len(y_batch); train_count += len(y_batch)
+                train_loss_sum += loss.item() * len(y_batch)
+                train_count += len(y_batch)
             train_loss = train_loss_sum / max(train_count, 1)
 
             val_loss = train_loss
-            if val_loader:
+            if val_loader is not None:
                 model.eval()
-                val_loss_sum, val_count = 0.0, 0
+                val_loss_sum = 0.0
+                val_count = 0
                 with torch.no_grad():
                     for X_batch, g_batch, y_batch in val_loader:
                         loss = loss_fn(model(X_batch.to(device), g_batch.to(device)), y_batch.to(device))
-                        val_loss_sum += loss.item() * len(y_batch); val_count += len(y_batch)
+                        val_loss_sum += loss.item() * len(y_batch)
+                        val_count += len(y_batch)
                 val_loss = val_loss_sum / max(val_count, 1)
 
-            if status_callback: status_callback(f"[{timeframe}] Epoch {epoch}/{epochs}  train={train_loss:.5f}  val={val_loss:.5f}")
+            if status_callback:
+                status_callback(f"[{timeframe}] Epoch {epoch}/{epochs}  train={train_loss:.5f}  val={val_loss:.5f}")
+
             if val_loss < best_val_loss - 1e-6:
-                best_val_loss, best_state, best_epoch, patience_counter = val_loss, copy.deepcopy(model.state_dict()), epoch, 0
+                best_val_loss = val_loss
+                best_state = copy.deepcopy(model.state_dict())
+                best_epoch = epoch
+                patience_counter = 0
             else:
                 patience_counter += 1
-                if patience_counter >= Config.EARLY_STOPPING_PATIENCE: break
+                if patience_counter >= Config.EARLY_STOPPING_PATIENCE:
+                    break
 
         model.load_state_dict(best_state)
         model.eval()
         self.model = model
-        self.training_history.update({"timeframe": timeframe, "best_epoch": best_epoch, "best_val_loss": best_val_loss, "epochs_run": epoch})
+        self.training_history.update({
+            "timeframe": timeframe,
+            "best_epoch": best_epoch,
+            "best_val_loss": best_val_loss,
+            "epochs_run": epoch,
+        })
+        return True
+
+    def train_single_timeframe(self, data, feature_cols, timeframe, num_groups, epochs=100, learning_rate=0.001,
+                               sequence_length=30, channels=None, kernel_size=3, dropout=0.2, batch_size=128,
+                               status_callback=None, **kwargs):
+        self.stop_flag = False
+        self.timeframe = timeframe
+        self.batch_size = batch_size
+        self.kernel_size = kernel_size
+        self.dropout = dropout
+        self.sequence_length = sequence_length
+        channels = channels or self.channels
+        self.channels = list(channels)
+
+        if len(data) == 0:
+            raise ValueError("Prepared dataframe is empty")
+        train_df, val_df = self._chronological_split(data)
+        if len(train_df) == 0:
+            raise ValueError("Train split produced an empty set")
+
+        scaler_state = self._fit_scalers(train_df, feature_cols)
+        train_df = self._apply_scalers(train_df, feature_cols, scaler_state)
+        val_df = self._apply_scalers(val_df, feature_cols, scaler_state) if len(val_df) else val_df
+
+        X_train, y_train, g_train, X_val, y_val, g_val, raw_close_val, raw_target_val = self._build_sequence_arrays(
+            train_df, val_df, feature_cols, sequence_length)
+
+        self._log(f"📊 [{timeframe}] Training sequences: {len(y_train):,}, Val: {len(y_val):,}")
+        train_loader = torch.utils.data.DataLoader(SequenceDataset(X_train, g_train, y_train), batch_size=batch_size, shuffle=True)
+        val_loader = torch.utils.data.DataLoader(SequenceDataset(X_val, g_val, y_val), batch_size=batch_size, shuffle=False) if len(y_val) > 0 else None
+
+        last_error = None
+        trained_ok = False
+        for device in self.gpu_manager.preferred_devices():
+            if self.stop_flag:
+                break
+            try:
+                trained_ok = self._run_training_loop(
+                    train_loader, val_loader, len(feature_cols), num_groups,
+                    self.channels, kernel_size, dropout, self.embedding_dim,
+                    epochs, learning_rate, device, timeframe, status_callback,
+                )
+                self.device_used = str(device)
+                break
+            except RuntimeError as exc:
+                last_error = exc
+                self._log(f"⚠️ [{timeframe}] device={device} failed: {exc}")
+                MemoryOptimizer.clear_cache()
+
+        if not trained_ok:
+            raise last_error if last_error else RuntimeError("No device succeeded")
+
+        self.scaler_state = scaler_state
+        self.is_trained = True
+        self.training_history["directional_accuracy"] = self._compute_directional_accuracy(
+            self.model, X_val, g_val, raw_close_val, raw_target_val,
+            torch.device(self.device_used), scaler_state,
+        )
+        if self.training_history["directional_accuracy"] is not None:
+            self._log(f"🎯 [{timeframe}] Directional accuracy: {self.training_history['directional_accuracy'] * 100:.1f}%")
         return True
 
     def save_model(self, model_dir, filename_stem, feature_cols, horizon, timeframe, num_groups, group_id_categories, sequence_length):
-        if not self.is_trained or self.model is None: return False
-        try:
-            output_dir = Path(model_dir)
-            output_dir.mkdir(parents=True, exist_ok=True)
-            model_path = output_dir / f"{filename_stem}{Config.MODEL_EXT}"
-            metadata_path = output_dir / f"{filename_stem}{Config.METADATA_EXT}"
-            torch.save(self.model.state_dict(), str(model_path))
-            metadata = {
-                "model_type": "torch.TCNRegressor", "timeframe": timeframe, "model_path": str(model_path),
-                "feature_columns": feature_cols, "categorical_features": ["group_id"], "group_id_categories": group_id_categories,
-                "num_groups": num_groups, "sequence_length": sequence_length,
-                "architecture": {"num_features": len(feature_cols), "channels": self.channels, "kernel_size": self.kernel_size, "dropout": self.dropout, "embedding_dim": self.embedding_dim},
-                "directional_accuracy": self.training_history.get("directional_accuracy"), "scaler_state": self.scaler_state,
-                "device_used": self.device_used, "horizon": horizon, "training_history": self.training_history, "training_time": datetime.now().isoformat(),
-            }
-            with open(metadata_path, "wb") as file: pickle.dump(metadata, file)
-            self._log(f"✅ TCN model saved: {model_path}")
-            return True
-        except Exception as exc:
-            self._log(f"❌ Save error: {exc}")
+        if not self.is_trained or self.model is None:
+            self._log("⚠️ No trained model available")
             return False
+
+        output_dir = Path(model_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        model_path = output_dir / f"{filename_stem}{Config.MODEL_EXT}"
+        metadata_path = output_dir / f"{filename_stem}{Config.METADATA_EXT}"
+
+        torch.save(self.model.state_dict(), str(model_path))
+
+        metadata = {
+            "model_type": "torch.TCNRegressor",
+            "timeframe": timeframe,
+            "model_path": str(model_path),
+            "feature_columns": feature_cols,
+            "categorical_features": ["group_id"],
+            "group_id_categories": group_id_categories,
+            "num_groups": num_groups,
+            "sequence_length": sequence_length,
+            "architecture": {
+                "num_features": len(feature_cols),
+                "channels": self.channels,
+                "kernel_size": self.kernel_size,
+                "dropout": self.dropout,
+                "embedding_dim": self.embedding_dim,
+            },
+            "directional_accuracy": self.training_history.get("directional_accuracy"),
+            "scaler_state": self.scaler_state,
+            "device_used": self.device_used,
+            "horizon": horizon,
+            "training_history": self.training_history,
+            "training_time": datetime.now().isoformat(),
+        }
+        with open(metadata_path, "wb") as file:
+            pickle.dump(metadata, file)
+
+        self._log(f"✅ TCN model saved: {model_path}")
+        self._log(f"✅ Metadata saved: {metadata_path}")
+        return True
 
 
 class TCNTrainerGUI(CTk):
+    INI_PATH = Path(__file__).with_suffix(".ini")
+
+    INDICATOR_CONFIG = [
+        ("ATR", "enable_atr", True),
+        ("Bollinger", "enable_bollinger", True),
+        ("CCI", "enable_cci", True),
+        ("CMF", "enable_cmf", True),
+        ("Donchian", "enable_donchian", True),
+        ("EMA", "enable_ema", True),
+        ("Force Index", "enable_force_index", True),
+        ("MACD", "enable_macd", True),
+        ("MFI", "enable_mfi", True),
+        ("OBV", "enable_obv", True),
+        ("Price Struct", "enable_price_structure", True),
+        ("Realized Vol", "enable_realized_vol", True),
+        ("ROC", "enable_roc", True),
+        ("RSI", "enable_rsi", True),
+        ("RVWAP", "enable_rvwap", True),
+        ("Stochastic", "enable_stochastic", True),
+        ("Volume", "enable_volume_metrics", True),
+    ]
+
     def __init__(self):
         super().__init__()
         self.title(Config.APP_TITLE)
         self.geometry(Config.APP_GEOMETRY)
         self.resizable(False, False)
+        self._is_closing = False
+
+        # Hide window while we build the UI and restore saved geometry,
+        # so the user never sees the default position/size flash before
+        # the saved position is applied.
+        self.withdraw()
 
         self.gui_logger = GUILogger()
         self.gui_logger.enable_console_redirect()
+
+        self.gpu_manager = GPUManager(verbose=False, log_callback=self.gui_logger.log)
 
         self.csv_folder = Config.DATASET_DIR
         self.model_folder = Config.MODEL_DIR
@@ -1042,9 +1179,102 @@ class TCNTrainerGUI(CTk):
         self.current_trainer = None
 
         self._create_ui()
+        self._load_state()  # applied while the window is hidden
         self.gui_logger.set_log_widget(self.log_text)
+
+        self.gpu_manager.log_system_info()
+
         self.after(500, self.scan_data_source)
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
+
+        # Flush pending geometry/layout work, then reveal the window.
+        self.update_idletasks()
+        self.deiconify()
+
+    def _load_state(self):
+        if not self.INI_PATH.exists():
+            return
+        cp = configparser.ConfigParser()
+        cp.read(str(self.INI_PATH))
+
+        if cp.has_section("window"):
+            geom = cp.get("window", "geometry", fallback="")
+            if geom:
+                # wm_geometry() is frame-relative and round-trips exactly
+                # through self.geometry() - no title-bar drift.
+                self.geometry(geom)
+            else:
+                # Legacy ini stored only x/y from winfo_x/winfo_y (client coords).
+                # On Windows this caused a ~37px downward creep per launch.
+                # Fall back to size only to break the drift loop.
+                x = cp.get("window", "x", fallback="")
+                y = cp.get("window", "y", fallback="")
+                if x and y:
+                    try:
+                        # winfo_x/y are client coords; geometry() expects
+                        # frame coords. Since we can't reliably reconstruct
+                        # the title-bar offset here, just restore size only
+                        # and let the WM place the window.
+                        self.geometry(Config.APP_GEOMETRY)
+                    except Exception:
+                        pass
+
+        if cp.has_section("paths"):
+            csv = cp.get("paths", "csv_folder", fallback="")
+            model = cp.get("paths", "model_folder", fallback="")
+            if csv:
+                self.csv_path_var.set(csv)
+                self.csv_folder = Path(csv)
+            if model:
+                self.model_path_var.set(model)
+                self.model_folder = Path(model)
+
+        if cp.has_section("params"):
+            self.horizon.set(cp.get("params", "horizon", fallback=str(Config.DEFAULT_HORIZON)))
+            self.epochs.set(cp.get("params", "epochs", fallback=str(Config.DEFAULT_EPOCHS)))
+            self.learning_rate.set(cp.get("params", "learning_rate", fallback=str(Config.DEFAULT_LEARNING_RATE)))
+            self.sequence_length.set(cp.get("params", "sequence_length", fallback=str(Config.DEFAULT_SEQUENCE_LENGTH)))
+            self.channels.set(cp.get("params", "channels", fallback=",".join(str(c) for c in Config.DEFAULT_CHANNELS)))
+            self.kernel_size.set(cp.get("params", "kernel_size", fallback=str(Config.DEFAULT_KERNEL_SIZE)))
+            self.batch_size.set(cp.get("params", "batch_size", fallback=str(Config.DEFAULT_BATCH_SIZE)))
+            self.dropout.set(cp.get("params", "dropout", fallback=str(Config.DEFAULT_DROPOUT)))
+
+        if cp.has_section("features"):
+            self.feature_cols_var.set(cp.get("features", "base_features", fallback="time,open,high,low,close,tick_volume"))
+
+        if cp.has_section("timeframes"):
+            for tf in Config.TIMEFRAMES:
+                if tf in self.tf_vars:
+                    self.tf_vars[tf].set(cp.getboolean("timeframes", tf, fallback=True))
+
+        if cp.has_section("indicators"):
+            for var_name in self.indicator_vars:
+                self.indicator_vars[var_name].set(cp.getboolean("indicators", var_name, fallback=True))
+
+    def _save_state(self):
+        cp = configparser.ConfigParser()
+        # Store wm_geometry() directly. It is frame-relative (same coordinate
+        # system that geometry() consumes), so a save/restore round-trip is
+        # exact. Using winfo_x()/winfo_y() instead caused the ~37px downward
+        # creep per launch because those return client-area coords.
+        cp["window"] = {"geometry": self.wm_geometry()}
+        cp["paths"] = {"csv_folder": str(self.csv_path_var.get()), "model_folder": str(self.model_path_var.get())}
+        cp["params"] = {
+            "horizon": self.horizon.get(),
+            "epochs": self.epochs.get(),
+            "learning_rate": self.learning_rate.get(),
+            "sequence_length": self.sequence_length.get(),
+            "channels": self.channels.get(),
+            "kernel_size": self.kernel_size.get(),
+            "batch_size": self.batch_size.get(),
+            "dropout": self.dropout.get(),
+        }
+        cp["features"] = {"base_features": self.feature_cols_var.get()}
+        cp["timeframes"] = {tf: str(var.get()) for tf, var in self.tf_vars.items()}
+        cp["indicators"] = {k: str(v.get()) for k, v in self.indicator_vars.items()}
+
+        with open(self.INI_PATH, "w") as f:
+            cp.write(f)
 
     def _create_ui(self):
         main_frame = CTkFrame(self, fg_color="transparent")
@@ -1133,7 +1363,7 @@ class TCNTrainerGUI(CTk):
         frame.pack(fill="x", pady=(0, 4))
         feature_frame = CTkFrame(frame, fg_color="transparent")
         feature_frame.pack(fill="x", padx=8, pady=3)
-        self.feature_cols_var = tk.StringVar(value="time,open,high,low,close,volume")
+        self.feature_cols_var = tk.StringVar(value="time,open,high,low,close,tick_volume")
         CTkLabel(feature_frame, text="Base Features (comma-separated):", font=("Ubuntu", 10)).pack(anchor="w", pady=(0, 2))
         CTkEntry(feature_frame, textvariable=self.feature_cols_var, height=28).pack(fill="x", pady=(0, 2))
 
@@ -1161,21 +1391,12 @@ class TCNTrainerGUI(CTk):
         checkboxes_frame = CTkFrame(indicator_frame, fg_color="transparent")
         checkboxes_frame.pack(fill="x")
 
-        indicators = [
-            ("ATR", "enable_atr"), ("Bollinger", "enable_bollinger"), ("CCI", "enable_cci"),
-            ("CMF", "enable_cmf"), ("Donchian", "enable_donchian"), ("EMA", "enable_ema"),
-            ("Force Index", "enable_force_index"), ("MACD", "enable_macd"), ("MFI", "enable_mfi"),
-            ("OBV", "enable_obv"), ("Price Struct", "enable_price_structure"), ("Realized Vol", "enable_realized_vol"),
-            ("ROC", "enable_roc"), ("RSI", "enable_rsi"), ("RVWAP", "enable_rvwap"),
-            ("Stochastic", "enable_stochastic"), ("Volume", "enable_volume_metrics")
-        ]
-
         self.indicator_vars = {}
         cols_per_row = 6
-        for i, (label, var_name) in enumerate(indicators):
+        for i, (label, var_name, default) in enumerate(self.INDICATOR_CONFIG):
             row_idx = i // cols_per_row
             col_idx = i % cols_per_row
-            var = tk.BooleanVar(value=True)
+            var = tk.BooleanVar(value=default)
             self.indicator_vars[var_name] = var
             ctk.CTkCheckBox(checkboxes_frame, text=label, variable=var, width=95, font=("Ubuntu", 10)).grid(row=row_idx, column=col_idx, padx=4, pady=2, sticky="w")
 
@@ -1202,14 +1423,17 @@ class TCNTrainerGUI(CTk):
     def _create_log_section(self, parent):
         frame = CTkFrame(parent, corner_radius=6)
         frame.pack(fill="both", expand=True)
-        self.log_text = CTkTextbox(frame, font=("Ubuntu Mono", 10))
+        self.log_text = CTkTextbox(frame, font=("Ubuntu Mono", 12))
         self.log_text.pack(fill="both", expand=True, padx=8, pady=3)
 
     def update_status(self, message):
+        if self._is_closing:
+            return
         self.status_text.configure(state="normal")
         self.status_text.delete("1.0", "end")
         self.status_text.insert("1.0", message)
         self.status_text.configure(state="disabled")
+        self.status_text.update_idletasks()
 
     def select_csv_folder(self):
         folder = filedialog.askdirectory(title="Select CSV Data Folder", initialdir=str(self.csv_folder))
@@ -1221,30 +1445,42 @@ class TCNTrainerGUI(CTk):
         folder = filedialog.askdirectory(title="Select Model Save Folder", initialdir=str(self.model_folder))
         if folder:
             self.model_path_var.set(folder)
-            global MODEL_DIR
-            MODEL_DIR = Path(folder)
-            MODEL_DIR.mkdir(parents=True, exist_ok=True)
+            self.model_folder = Path(folder)
+            self.model_folder.mkdir(parents=True, exist_ok=True)
+            self.gui_logger.log(f"💾 Model folder set to: {self.model_folder}")
 
     def scan_data_source(self):
         csv_folder = Path(self.csv_path_var.get())
         if not csv_folder.exists():
+            self.gui_logger.log(f"❌ CSV folder not found: {csv_folder}", "error")
             self.status_label.configure(text="❌ Folder not found")
             self.train_btn.configure(state="disabled")
             return
+        self.gui_logger.log(f"📁 Scanning CSV folder: {csv_folder}")
         symbols, timeframes = self.data_preparer.scan_folder(csv_folder)
         if not symbols:
+            self.gui_logger.log("⚠️ No symbols found", "warning")
             self.status_label.configure(text="⚠️ No symbols found")
             self.train_btn.configure(state="disabled")
             return
         self.status_label.configure(text=f"✅ Found {len(symbols)} symbols, {len(timeframes)} timeframes")
+        self.gui_logger.log(f"✅ Loaded {len(symbols)} symbols", "success")
         self.train_btn.configure(state="normal")
 
     def start_training(self):
-        if self.is_training: return
+        if self.is_training:
+            self.gui_logger.log("⏳ Training already in progress", "warning")
+            return
+
         csv_folder = self.csv_path_var.get()
-        if not Path(csv_folder).exists(): return
+        if not Path(csv_folder).exists():
+            self.gui_logger.log("❌ Invalid CSV folder", "error")
+            return
+
         selected_timeframes = [tf for tf, var in self.tf_vars.items() if var.get()]
-        if not selected_timeframes: return
+        if not selected_timeframes:
+            self.gui_logger.log("❌ Select at least one timeframe", "error")
+            return
 
         self.is_training = True
         self.stop_flag = False
@@ -1252,66 +1488,107 @@ class TCNTrainerGUI(CTk):
         self.stop_btn.configure(state="normal")
 
         def training_task():
-            try:
-                self.gui_logger.log("=" * 60)
-                self.gui_logger.log("🚀 Starting Per-Timeframe TCN Training")
+            self.gui_logger.log("=" * 60)
+            self.gui_logger.log("🚀 Starting Per-Timeframe TCN Training")
+            self.gui_logger.log("=" * 60)
+            self.gui_logger.log(f"📂 CSV Folder: {csv_folder}")
+            self.gui_logger.log(f"💾 System RAM: {MemoryOptimizer.get_system_memory_available_gb():.1f} GB available")
 
-                flags = {k: v.get() for k, v in self.indicator_vars.items()}
-                self.data_preparer.set_indicator_flags(**flags)
+            flags = {k: v.get() for k, v in self.indicator_vars.items()}
+            self.data_preparer.set_indicator_flags(**flags)
 
-                enabled_list = [k.replace("enable_", "").upper() for k, v in self.indicator_vars.items() if v.get()]
-                self.gui_logger.log(f"📊 Indicators enabled: {', '.join(enabled_list)}")
+            enabled_list = [k.replace("enable_", "").upper() for k, v in self.indicator_vars.items() if v.get()]
+            self.gui_logger.log(f"📊 Indicators enabled ({len(enabled_list)}): {', '.join(enabled_list)}")
 
-                feature_input = self.feature_cols_var.get().strip()
-                feature_cols = [f.strip() for f in feature_input.split(',') if f.strip()] if feature_input else Config.DEFAULT_FEATURES
-                horizon = int(self.horizon.get())
-                epochs = int(self.epochs.get())
-                learning_rate = float(self.learning_rate.get())
-                sequence_length = int(self.sequence_length.get())
-                channels = [int(c.strip()) for c in self.channels.get().split(',') if c.strip()]
-                kernel_size = int(self.kernel_size.get())
-                batch_size = int(self.batch_size.get())
-                dropout = float(self.dropout.get())
-                model_folder = self.model_path_var.get()
+            feature_input = self.feature_cols_var.get().strip()
+            if feature_input:
+                feature_cols = [f.strip() for f in feature_input.split(',') if f.strip()]
+            else:
+                feature_cols = Config.DEFAULT_FEATURES
 
-                results = {}
-                for timeframe in selected_timeframes:
-                    if self.stop_flag: break
-                    self.update_status(f"[{timeframe}] Building dataset...")
-                    try:
-                        data = self.data_preparer.build_dataframe_for_timeframe(csv_folder, feature_cols, horizon, timeframe)
-                    except ValueError as exc:
-                        results[timeframe] = "skipped"
-                        continue
+            horizon = int(self.horizon.get())
+            epochs = int(self.epochs.get())
+            learning_rate = float(self.learning_rate.get())
+            sequence_length = int(self.sequence_length.get())
+            channels = [int(c.strip()) for c in self.channels.get().split(',') if c.strip()]
+            kernel_size = int(self.kernel_size.get())
+            batch_size = int(self.batch_size.get())
+            dropout = float(self.dropout.get())
+            model_folder = self.model_path_var.get()
 
-                    self.update_status(f"[{timeframe}] Training TCN model...")
-                    trainer = StreamingTCNTrainer(self.gui_logger.log, timeframe=timeframe)
-                    self.current_trainer = trainer
-                    success = trainer.train_single_timeframe(
-                        data=data, feature_cols=self.data_preparer.feature_cols, timeframe=timeframe,
-                        num_groups=len(self.data_preparer.group_id_categories), epochs=epochs, learning_rate=learning_rate,
-                        sequence_length=sequence_length, channels=channels, kernel_size=kernel_size,
-                        dropout=dropout, batch_size=batch_size, status_callback=self.update_status
-                    )
-                    if success and not trainer.stop_flag:
-                        filename_stem = f"{Config.MODEL_PREFIX}_{timeframe}"
-                        trainer.save_model(model_folder, filename_stem, self.data_preparer.feature_cols, horizon, timeframe, len(self.data_preparer.group_id_categories), self.data_preparer.group_id_categories, sequence_length)
+            results = {}
+
+            for timeframe in selected_timeframes:
+                if self.stop_flag or self._is_closing:
+                    self.gui_logger.log("⏹️ Training stopped by user", "warning")
+                    break
+
+                self.gui_logger.log("-" * 60)
+                self.gui_logger.log(f"▶️ Timeframe: {timeframe}")
+                self.update_status(f"[{timeframe}] Building dataset...")
+
+                data = self.data_preparer.build_dataframe_for_timeframe(
+                    csv_folder=csv_folder,
+                    feature_cols=feature_cols,
+                    horizon=horizon,
+                    timeframe=timeframe,
+                )
+
+                feature_columns = self.data_preparer.feature_cols
+                self.update_status(f"[{timeframe}] Training TCN model...")
+
+                trainer = StreamingTCNTrainer(self.gui_logger.log, timeframe=timeframe)
+                self.current_trainer = trainer
+
+                success = trainer.train_single_timeframe(
+                    data=data,
+                    feature_cols=feature_columns,
+                    timeframe=timeframe,
+                    num_groups=len(self.data_preparer.group_id_categories),
+                    epochs=epochs,
+                    learning_rate=learning_rate,
+                    sequence_length=sequence_length,
+                    channels=channels,
+                    kernel_size=kernel_size,
+                    dropout=dropout,
+                    batch_size=batch_size,
+                    status_callback=self.update_status,
+                )
+
+                if success and not trainer.stop_flag:
+                    filename_stem = f"{Config.MODEL_PREFIX}_{timeframe}"
+                    if trainer.save_model(
+                        model_dir=model_folder,
+                        filename_stem=filename_stem,
+                        feature_cols=feature_columns,
+                        horizon=horizon,
+                        timeframe=timeframe,
+                        num_groups=len(self.data_preparer.group_id_categories),
+                        group_id_categories=self.data_preparer.group_id_categories,
+                        sequence_length=sequence_length,
+                    ):
+                        self.gui_logger.log(f"✅ [{timeframe}] Model saved: {filename_stem}{Config.MODEL_EXT}", "success")
                         results[timeframe] = f"trained ({trainer.device_used})"
                     else:
-                        results[timeframe] = "stopped" if trainer.stop_flag else "failed"
+                        results[timeframe] = "failed to save"
+                elif trainer.stop_flag:
+                    results[timeframe] = "stopped"
+                    self.stop_flag = True
+                else:
+                    results[timeframe] = "training failed"
 
-                    del trainer
-                    self.current_trainer = None
-                    MemoryOptimizer.clear_cache()
-
-                self.gui_logger.log(f"🏁 Summary: {', '.join(f'{tf}: {status}' for tf, status in results.items())}")
-                self.update_status("Done.")
-            except Exception as e:
-                self.gui_logger.log(f"❌ Training error: {e}", "error")
-                traceback.print_exc()
-            finally:
-                self.is_training = False
+                del trainer
                 self.current_trainer = None
+                MemoryOptimizer.clear_cache()
+
+            summary = ", ".join(f"{tf}: {status}" for tf, status in results.items())
+            self.gui_logger.log("=" * 60)
+            self.gui_logger.log(f"🏁 Summary: {summary}")
+            self.update_status(f"Done. {summary}")
+
+            self.is_training = False
+            self.current_trainer = None
+            if not self._is_closing:
                 self.train_btn.configure(state="normal")
                 self.stop_btn.configure(state="disabled")
 
@@ -1319,23 +1596,38 @@ class TCNTrainerGUI(CTk):
 
     def stop_training(self):
         self.stop_flag = True
-        if self.current_trainer: self.current_trainer.stop_training()
+        if self.current_trainer is not None:
+            self.current_trainer.stop_training()
+        self.gui_logger.log("⏹️ Stopping training...", "warning")
 
     def _on_closing(self):
-        self.gui_logger.disable_console_redirect()
-        if self.is_training:
-            if messagebox.askyesno("Training in Progress", "Stop training and quit?"):
-                self.stop_flag = True
-                if self.current_trainer: self.current_trainer.stop_training()
-                self.after(100, self.destroy)
-        else:
-            if messagebox.askyesno("Quit", "Do you want to quit?"):
-                self.destroy()
+        if self._is_closing:
+            return
+        self._is_closing = True
+        self._save_state()
 
+        def do_exit():
+            self.gui_logger.disable_console_redirect()
+            self.destroy()
 
-def main():
-    app = TCNTrainerGUI()
-    app.mainloop()
+        def confirm_exit():
+            if self.is_training:
+                if messagebox.askyesno("Training in Progress", "Stop training and quit?"):
+                    self.stop_flag = True
+                    if self.current_trainer is not None:
+                        self.current_trainer.stop_training()
+                    self.after(200, do_exit)
+                else:
+                    self._is_closing = False
+            else:
+                if messagebox.askyesno("Quit", "Do you want to quit AI Predict Train (TCN)?"):
+                    do_exit()
+                else:
+                    self._is_closing = False
+
+        self.after(0, confirm_exit)
+
 
 if __name__ == "__main__":
-    main()
+    app = TCNTrainerGUI()
+    app.mainloop()

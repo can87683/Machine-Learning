@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # ai_predict_train.py
-# Copyright Su Nie | BSD-3C License | https://github.com/can87683
 
 import setproctitle
 setproctitle.setproctitle("ai_predict_train.py")

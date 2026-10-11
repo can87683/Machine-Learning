@@ -1,6 +1,10 @@
+"""
+catboost customtkinter numpy pandas psutil setproctitle
+"""
 #!/usr/bin/env python3
 # ai_predict_train_catboost.py
 # Copyright Su Nie | BSD-3C License | https://github.com/can87683
+
 
 import setproctitle
 setproctitle.setproctitle("ai_predict_train_catboost_ctk")
@@ -11,41 +15,28 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 import threading
 import subprocess
+import configparser
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import pickle
-import json
 import gc
 import psutil
 from datetime import datetime
-import traceback
 import sys
-import os
-import time
-import warnings
 
 from catboost import CatBoostRegressor, Pool
 
-# Suppress FutureWarnings
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
-
 
 class Config:
-    """Central configuration for all settings"""
-
-    # Paths
     HOME = Path.home()
     MODEL_DIR = HOME / "ai_model_ml"
     DATASET_DIR = HOME / "mt5_data"
 
-    # Data settings
     MAX_ROWS_PER_SYMBOL = 20000
     MAX_DATASET_ROWS = 200000
-    DEFAULT_FEATURES = ['time', 'open', 'high', 'low', 'close', 'volume']
+    DEFAULT_FEATURES = ['time', 'open', 'high', 'low', 'close', 'tick_volume']
 
-    # Model settings (CatBoost)
     DEFAULT_HORIZON = 10
     DEFAULT_ITERATIONS = 1000
     DEFAULT_LEARNING_RATE = 0.05
@@ -78,6 +69,8 @@ class Config:
     THEME = "dark"
     COLOR_THEME = "dark-blue"
 
+    SEED = 42
+
     @classmethod
     def ensure_directories(cls):
         cls.MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -85,7 +78,6 @@ class Config:
 
 
 Config.ensure_directories()
-
 ctk.set_appearance_mode(Config.THEME)
 ctk.set_default_color_theme(Config.COLOR_THEME)
 
@@ -95,85 +87,113 @@ DATASET_DIR = Config.DATASET_DIR
 
 
 class GPUManager:
-    def __init__(self, verbose=True):
+    def __init__(self, verbose=True, log_callback=None):
         self.verbose = verbose
+        self.log_callback = log_callback
         self.gpu_available = False
         self.gpu_name = None
+        self.gpu_memory_gb = 0.0
         self._detect_gpu()
 
     def _log(self, message):
-        if self.verbose:
+        if self.log_callback:
+            self.log_callback(message)
+        elif self.verbose:
             print(f"[GPUManager] {message}")
 
     def _detect_gpu(self):
-        try:
-            result = subprocess.run(
-                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-                capture_output=True,
-                text=True,
-                timeout=3,
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            self.gpu_available = True
+            self.gpu_name = result.stdout.strip().splitlines()[0]
+            mem_result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=3
             )
-            if result.returncode == 0 and result.stdout.strip():
-                self.gpu_available = True
-                self.gpu_name = result.stdout.strip().splitlines()[0]
-                self._log(f"✅ GPU detected: {self.gpu_name}")
-            else:
-                self._log("ℹ️ No GPU detected, using CPU")
-        except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
-            self.gpu_available = False
+            self.gpu_memory_gb = float(mem_result.stdout.strip().split()[0]) / 1024.0
+            self._log(f"✅ GPU detected: {self.gpu_name} ({self.gpu_memory_gb:.2f} GB)")
+        else:
             self._log("ℹ️ No GPU detected, using CPU")
 
     def preferred_task_types(self):
+        return ["GPU", "CPU"] if self.gpu_available else ["CPU"]
+
+    def log_system_info(self):
+        self._log("=" * 60)
+        self._log("🖥️ System & Library Information")
+        self._log("=" * 60)
+        self._log(f"🐍 Python: {sys.version.split()[0]}")
+        try:
+            import catboost
+            self._log(f"🐱 CatBoost: {catboost.__version__}")
+        except ImportError:
+            self._log("🐱 CatBoost: Not installed")
         if self.gpu_available:
-            return ["GPU", "CPU"]
-        return ["CPU"]
+            self._log(f"🎮 GPU Device: {self.gpu_name}")
+            self._log(f"💾 GPU Memory: {self.gpu_memory_gb:.2f} GB")
+        else:
+            self._log("⚠️ No GPU detected. Will use CPU.")
+        self._log("=" * 60)
 
 
 class UsageRow:
-    def __init__(self, parent):
-        self.parent = parent
-        self.usage_frame = None
-        self.usage_label = None
-        self._create_usage_row()
+    # --- Display constants ---
+    FRAME_HEIGHT = 40
+    FRAME_CORNER_RADIUS = 5
+    FRAME_PADY = (0, 10)
 
-    def _create_usage_row(self):
-        self.usage_frame = CTkFrame(self.parent, height=35, corner_radius=5)
-        self.usage_frame.pack(fill="x", pady=(0, 5))
+    FONT = ("Ubuntu Mono", 20)
+    TEXT_COLOR = "Lime"
+    PLACEHOLDER_TEXT = "Loading system usage..."
+
+    LABEL_PADX = 10
+    LABEL_PADY = 5
+
+    REFRESH_MS = 2000
+    CPU_SAMPLE_INTERVAL = 0.5
+
+    def __init__(self, parent):
+        self.usage_frame = CTkFrame(
+            parent,
+            height=self.FRAME_HEIGHT,
+            corner_radius=self.FRAME_CORNER_RADIUS,
+        )
+        self.usage_frame.pack(fill="x", pady=self.FRAME_PADY)
 
         self.usage_label = CTkLabel(
             self.usage_frame,
-            text="Loading system usage...",
-            font=("Ubuntu Mono", 18),
-            text_color="Lime"
+            text=self.PLACEHOLDER_TEXT,
+            font=self.FONT,
+            text_color=self.TEXT_COLOR,
         )
-        self.usage_label.pack(expand=True, fill="x", padx=10, pady=3)
-
+        self.usage_label.pack(
+            expand=True, fill="x",
+            padx=self.LABEL_PADX, pady=self.LABEL_PADY,
+        )
         self._update_usage()
 
     def _update_usage(self):
+        cpu = psutil.cpu_percent(interval=self.CPU_SAMPLE_INTERVAL)
+        dram = psutil.virtual_memory().percent
+        gpu_percent = vram_percent = 0
         try:
-            cpu = psutil.cpu_percent(interval=0.5)
-            dram = psutil.virtual_memory().percent
-
-            gpu_percent = 0
-            vram_percent = 0
-            try:
-                import GPUtil
-                gpus = GPUtil.getGPUs()
-                if gpus:
-                    gpu = gpus[0]
-                    gpu_percent = gpu.load * 100
-                    vram_percent = gpu.memoryUtil * 100
-            except (ImportError, Exception):
-                pass
-
-            self.usage_label.configure(
-                text=f"CPU: {cpu:.1f}%  DRAM: {dram:.1f}%  GPU: {gpu_percent:.1f}%  VRAM: {vram_percent:.1f}%"
-            )
-        except Exception:
-            self.usage_label.configure(text="⚠️ System monitoring unavailable")
-
-        self.usage_label.after(2000, self._update_usage)
+            import GPUtil
+            gpus = GPUtil.getGPUs()
+            if gpus:
+                gpu_percent = gpus[0].load * 100
+                vram_percent = gpus[0].memoryUtil * 100
+        except ImportError:
+            pass
+        self.usage_label.configure(
+            text=f"CPU: {cpu:.1f}%  DRAM: {dram:.1f}%  "
+                 f"GPU: {gpu_percent:.1f}%  VRAM: {vram_percent:.1f}%"
+        )
+        self.usage_label.after(self.REFRESH_MS, self._update_usage)
 
 
 class ConsoleLogger:
@@ -211,7 +231,6 @@ class MemoryOptimizer:
 
 
 class FeatureEngineer:
-    # Map each indicator flag to the columns it produces
     FLAG_TO_FEATURES = {
         'enable_adx': ['adx', 'plus_di', 'minus_di'],
         'enable_atr': ['atr'],
@@ -257,10 +276,8 @@ class FeatureEngineer:
 
     @staticmethod
     def add_technical_features(df, **flags):
-        """Compute all selected indicators on-the-fly with leak-safe expanding windows."""
         df = df.copy()
 
-        # --- Base transforms (always available if columns exist) ---
         if all(c in df.columns for c in ['high', 'low', 'close']):
             df['high_low_ratio'] = df['high'] / df['low']
             df['close_high_ratio'] = df['close'] / df['high']
@@ -271,10 +288,9 @@ class FeatureEngineer:
             df['returns_5'] = df['close'].pct_change(periods=5)
             df['returns_10'] = df['close'].pct_change(periods=10)
 
-        if 'volume' in df.columns:
-            df['volume_ratio'] = df['volume'] / df['volume'].rolling(5, min_periods=1).mean()
+        if 'tick_volume' in df.columns:
+            df['tick_volume_ratio'] = df['tick_volume'] / df['tick_volume'].rolling(5, min_periods=1).mean()
 
-        # --- True Range (used by ATR, ADX, etc.) ---
         if all(c in df.columns for c in ['high', 'low', 'close']):
             prev_close = df['close'].shift(1)
             df['true_range'] = pd.concat([
@@ -283,34 +299,27 @@ class FeatureEngineer:
                 (df['low'] - prev_close).abs(),
             ], axis=1).max(axis=1)
 
-        # --- ADX ---
         if flags.get('enable_adx', False) and all(c in df.columns for c in ['high', 'low', 'close']):
             df = FeatureEngineer._add_adx(df, period=14)
 
-        # --- ATR ---
         if flags.get('enable_atr', False) and 'true_range' in df.columns:
             df['atr'] = df['true_range'].ewm(alpha=1/14, min_periods=1, adjust=False).mean()
 
-        # --- Bollinger Bands ---
         if flags.get('enable_bb', False) and 'close' in df.columns:
             df = FeatureEngineer._add_bb(df, period=20)
 
-        # --- CCI ---
         if flags.get('enable_cci', False) and all(c in df.columns for c in ['high', 'low', 'close']):
             df = FeatureEngineer._add_cci(df, period=20)
 
-        # --- EMA ---
         if flags.get('enable_ema', False) and 'close' in df.columns:
             df['ema_12'] = df['close'].ewm(span=12, min_periods=1, adjust=False).mean()
             df['ema_26'] = df['close'].ewm(span=26, min_periods=1, adjust=False).mean()
             df['ema_50'] = df['close'].ewm(span=50, min_periods=1, adjust=False).mean()
             df['ema_200'] = df['close'].ewm(span=200, min_periods=1, adjust=False).mean()
 
-        # --- Keltner Channels ---
         if flags.get('enable_kc', False) and all(c in df.columns for c in ['high', 'low', 'close']):
             df = FeatureEngineer._add_kc(df, period=20)
 
-        # --- MACD ---
         if flags.get('enable_macd', False) and 'close' in df.columns:
             ema_fast = df['close'].ewm(span=12, adjust=False).mean()
             ema_slow = df['close'].ewm(span=26, adjust=False).mean()
@@ -320,43 +329,34 @@ class FeatureEngineer:
             df['macd_signal'] = signal_line
             df['macd_hist'] = macd_line - signal_line
 
-        # --- MFI ---
-        if flags.get('enable_mfi', False) and all(c in df.columns for c in ['high', 'low', 'close', 'volume']):
+        if flags.get('enable_mfi', False) and all(c in df.columns for c in ['high', 'low', 'close', 'tick_volume']):
             df = FeatureEngineer._add_mfi(df, period=14)
 
-        # --- OBV ---
-        if flags.get('enable_obv', False) and all(c in df.columns for c in ['close', 'volume']):
+        if flags.get('enable_obv', False) and all(c in df.columns for c in ['close', 'tick_volume']):
             df = FeatureEngineer._add_obv(df)
 
-        # --- ROC ---
         if flags.get('enable_roc', False) and 'close' in df.columns:
             df['roc'] = ((df['close'] - df['close'].shift(12)) / df['close'].shift(12).replace(0, np.nan)) * 100
 
-        # --- RSI ---
         if flags.get('enable_rsi', False) and 'close' in df.columns:
             df = FeatureEngineer._add_rsi(df, period=14)
 
-        # --- SMA ---
         if flags.get('enable_sma', False) and 'close' in df.columns:
             df['sma_20'] = df['close'].rolling(20, min_periods=1).mean()
             df['sma_50'] = df['close'].rolling(50, min_periods=1).mean()
             df['sma_200'] = df['close'].rolling(200, min_periods=1).mean()
 
-        # --- Stochastic ---
         if flags.get('enable_stochastic', False) and all(c in df.columns for c in ['high', 'low', 'close']):
             df = FeatureEngineer._add_stochastic(df, period=14, smooth=3)
 
-        # --- Volume MA ---
-        if flags.get('enable_vol_ma', False) and 'volume' in df.columns:
-            df['volume_ema_20'] = df['volume'].ewm(span=20, min_periods=1, adjust=False).mean()
-            df['volume_sma_20'] = df['volume'].rolling(20, min_periods=1).mean()
+        if flags.get('enable_vol_ma', False) and 'tick_volume' in df.columns:
+            df['volume_ema_20'] = df['tick_volume'].ewm(span=20, min_periods=1, adjust=False).mean()
+            df['volume_sma_20'] = df['tick_volume'].rolling(20, min_periods=1).mean()
 
-        # --- VWAP ---
-        if flags.get('enable_vwap', False) and all(c in df.columns for c in ['high', 'low', 'close', 'volume']):
+        if flags.get('enable_vwap', False) and all(c in df.columns for c in ['high', 'low', 'close', 'tick_volume']):
             typical = (df['high'] + df['low'] + df['close']) / 3
-            df['vwap'] = (typical * df['volume']).cumsum() / df['volume'].cumsum()
+            df['vwap'] = (typical * df['tick_volume']).cumsum() / df['tick_volume'].cumsum()
 
-        # --- Williams %R ---
         if flags.get('enable_willr', False) and all(c in df.columns for c in ['high', 'low', 'close']):
             lowest = df['low'].rolling(14, min_periods=1).min()
             highest = df['high'].rolling(14, min_periods=1).max()
@@ -365,9 +365,6 @@ class FeatureEngineer:
 
         return df
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
     @staticmethod
     def _add_rsi(df, period=14):
         delta = df['close'].diff()
@@ -440,7 +437,7 @@ class FeatureEngineer:
     @staticmethod
     def _add_mfi(df, period=14):
         typical = (df['high'] + df['low'] + df['close']) / 3
-        raw_money = typical * df['volume']
+        raw_money = typical * df['tick_volume']
         diff = typical.diff()
         positive = raw_money.where(diff > 0, 0)
         negative = raw_money.where(diff < 0, 0)
@@ -452,15 +449,8 @@ class FeatureEngineer:
 
     @staticmethod
     def _add_obv(df):
-        obv = [0]
-        for i in range(1, len(df)):
-            if df['close'].iloc[i] > df['close'].iloc[i-1]:
-                obv.append(obv[-1] + df['volume'].iloc[i])
-            elif df['close'].iloc[i] < df['close'].iloc[i-1]:
-                obv.append(obv[-1] - df['volume'].iloc[i])
-            else:
-                obv.append(obv[-1])
-        df['obv'] = pd.Series(obv, index=df.index)
+        direction = np.sign(df['close'].diff()).fillna(0.0)
+        df['obv'] = (direction * df['tick_volume']).cumsum()
         return df
 
 
@@ -475,30 +465,21 @@ class GUILogger:
     def set_log_widget(self, widget):
         self.log_widget = widget
         self.ready = True
-        self.log_widget.configure(font=("Ubuntu Mono", 11))
+        self.log_widget.configure(font=("Ubuntu Mono", 12))
         for msg, level in self.messages:
             self._write_to_widget(msg, level)
         self.messages.clear()
 
     def _write_to_widget(self, message, level):
-        if self.log_widget:
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            log_entry = f"[{timestamp}] {message}\n"
-            try:
-                self.log_widget.insert("end", log_entry)
-                self.log_widget.see("end")
-                self.log_widget.update_idletasks()
-            except Exception:
-                print(log_entry, flush=True)
+        log_entry = f"[{datetime.now().strftime('%H:%M:%S')}] {message}\n"
+        self.log_widget.insert("end", log_entry)
+        self.log_widget.see("end")
+        self.log_widget.update_idletasks()
 
     def log(self, message, level="info"):
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        console_entry = f"[{timestamp}] [{level.upper()}] {message}"
-        try:
-            self._original_stdout.write(console_entry + "\n")
-            self._original_stdout.flush()
-        except Exception:
-            print(console_entry, flush=True)
+        console_entry = f"[{datetime.now().strftime('%H:%M:%S')}] [{level.upper()}] {message}"
+        self._original_stdout.write(console_entry + "\n")
+        self._original_stdout.flush()
         if self.ready and self.log_widget:
             self._write_to_widget(message, level)
         else:
@@ -532,69 +513,48 @@ class StreamingDataPreparer:
 
     def load_csv_data(self, symbol, timeframe, csv_folder):
         csv_file = Path(csv_folder) / symbol / f"{symbol}_{timeframe}.csv"
-
         if not csv_file.exists():
             return None
 
-        try:
-            df = pd.read_csv(csv_file)
-
-            if "time" not in df.columns:
-                self._log(f"⚠️ Missing time column: {csv_file}")
-                return None
-
-            if pd.api.types.is_numeric_dtype(df["time"]):
-                df["time"] = pd.to_datetime(df["time"], unit="s")
-            else:
-                df["time"] = pd.to_datetime(df["time"])
-
-            df = (
-                df.sort_values("time")
-                .drop_duplicates("time")
-                .reset_index(drop=True)
-            )
-
-            return df
-
-        except Exception as exc:
-            self._log(f"❌ Error loading {csv_file}: {exc}")
+        df = pd.read_csv(csv_file)
+        if "time" not in df.columns:
+            self._log(f"⚠️ Missing time column: {csv_file}")
             return None
+
+        if pd.api.types.is_numeric_dtype(df["time"]):
+            df["time"] = pd.to_datetime(df["time"], unit="s")
+        else:
+            df["time"] = pd.to_datetime(df["time"])
+
+        df = df.sort_values("time").drop_duplicates("time").reset_index(drop=True)
+        return df
 
     def scan_folder(self, csv_folder):
         csv_folder = Path(csv_folder)
-
         if not csv_folder.exists():
             return [], []
 
         symbols = []
         all_timeframes = set()
-
         for symbol_dir in sorted(csv_folder.iterdir()):
             if not symbol_dir.is_dir():
                 continue
-
             symbol = symbol_dir.name
             found_timeframes = []
-
             for timeframe in Config.TIMEFRAMES:
                 csv_file = symbol_dir / f"{symbol}_{timeframe}.csv"
-
                 if csv_file.exists():
                     found_timeframes.append(timeframe)
                     all_timeframes.add(timeframe)
-
             if found_timeframes:
                 symbols.append((symbol, found_timeframes))
                 self._log(f"   ✓ {symbol}: {', '.join(found_timeframes)}")
-
         return symbols, sorted(all_timeframes)
 
     def _prepare_single_series(self, df, symbol, horizon, requested_features):
         if df is None or len(df) < 100:
             return None
-
         df = df.copy()
-
         if len(df) > Config.MAX_ROWS_PER_SYMBOL:
             df = df.iloc[-Config.MAX_ROWS_PER_SYMBOL:].copy()
 
@@ -603,15 +563,13 @@ class StreamingDataPreparer:
 
         requested_features = [c for c in requested_features if c != "time"]
 
-        # Base engineered features that always exist
         base_engineered = [
             "hour_sin", "hour_cos", "day_sin", "day_cos",
             "month_sin", "month_cos",
             "high_low_ratio", "close_high_ratio", "close_low_ratio",
-            "returns_1", "returns_5", "returns_10", "volume_ratio",
+            "returns_1", "returns_5", "returns_10", "tick_volume_ratio",
         ]
 
-        # Add columns for enabled indicators
         indicator_features = []
         for flag, cols in FeatureEngineer.FLAG_TO_FEATURES.items():
             if self.indicator_flags.get(flag, False):
@@ -620,7 +578,7 @@ class StreamingDataPreparer:
         candidate_features = list(dict.fromkeys(requested_features + base_engineered + indicator_features))
         available_features = [c for c in candidate_features if c in df.columns]
 
-        required_columns = ["open", "high", "low", "close", "volume"]
+        required_columns = ["open", "high", "low", "close", "tick_volume"]
         for column in required_columns:
             if column in df.columns and column not in available_features:
                 available_features.append(column)
@@ -628,7 +586,6 @@ class StreamingDataPreparer:
         if "close" not in df.columns:
             self._log(f"⚠️ Skipping {symbol}: close column unavailable")
             return None
-
         if not available_features:
             self._log(f"⚠️ Skipping {symbol}: no usable features")
             return None
@@ -643,7 +600,6 @@ class StreamingDataPreparer:
 
         df[self.target_column] = df["close"].shift(-horizon)
         df = df.dropna(subset=[self.target_column]).copy()
-
         if len(df) < 50:
             return None
 
@@ -656,26 +612,20 @@ class StreamingDataPreparer:
     def build_dataframe_for_timeframe(self, csv_folder, feature_cols, horizon, timeframe):
         csv_folder = Path(csv_folder)
         symbols, _ = self.scan_folder(csv_folder)
-
         symbols_with_tf = [s for s, tfs in symbols if timeframe in tfs]
-
         if not symbols_with_tf:
             raise ValueError(f"No symbols found with timeframe {timeframe} in {csv_folder}")
 
         frames = []
         all_features = []
-
         for symbol in symbols_with_tf:
             df = self.load_csv_data(symbol, timeframe, csv_folder)
             prepared = self._prepare_single_series(df, symbol, horizon, feature_cols)
-
             if prepared is None:
                 continue
-
             prepared_df, available_features = prepared
             frames.append(prepared_df)
             all_features.extend(available_features)
-
             self._log(f"   📊 {symbol}_{timeframe}: {len(prepared_df)} rows")
 
         if not frames:
@@ -706,13 +656,11 @@ class StreamingDataPreparer:
         )
 
         result["group_id"] = result["group_id"].astype(str)
-
         result = result.sort_values(["group_id", "time_idx"]).reset_index(drop=True)
 
         self.feature_cols = all_features
         self._log(f"✅ [{timeframe}] Prepared {len(result):,} rows, {result['group_id'].nunique()} symbols")
         self._log(f"✅ [{timeframe}] Numeric features: {len(self.feature_cols)}")
-
         return result
 
 
@@ -720,9 +668,7 @@ class StreamingCatBoostTrainer:
     def __init__(self, log_callback=None, timeframe=None):
         self.log_callback = log_callback or print
         self.timeframe = timeframe
-
         self.gpu_manager = GPUManager(verbose=False)
-
         self.model = None
         self.is_trained = False
         self.stop_flag = False
@@ -734,9 +680,7 @@ class StreamingCatBoostTrainer:
         self.depth = tf_params.get("depth", Config.DEFAULT_DEPTH)
         self.l2_leaf_reg = tf_params.get("l2_leaf_reg", Config.DEFAULT_L2_REG)
         self.subsample = Config.DEFAULT_SUBSAMPLE
-
         self.quantiles = list(Config.QUANTILES)
-
         self.training_history = {}
 
         preferred = " -> ".join(self.gpu_manager.preferred_task_types())
@@ -753,13 +697,16 @@ class StreamingCatBoostTrainer:
 
     def _chronological_split(self, data):
         train_parts, val_parts = [], []
-
         for _, group in data.groupby("group_id"):
             group = group.sort_values("time_idx")
-            n_val = max(1, int(len(group) * Config.VALIDATION_FRACTION))
+            n = len(group)
+            if n < 5:
+                train_parts.append(group)
+                continue
+            n_val = max(1, int(n * Config.VALIDATION_FRACTION))
+            n_val = min(n_val, n - 1)
             train_parts.append(group.iloc[:-n_val])
             val_parts.append(group.iloc[-n_val:])
-
         train_df = pd.concat(train_parts, ignore_index=True)
         val_df = pd.concat(val_parts, ignore_index=True)
         return train_df, val_df
@@ -770,7 +717,6 @@ class StreamingCatBoostTrainer:
 
     def _build_model(self, task_type, iterations, learning_rate, depth):
         loss = self._multiquantile_loss_string()
-
         params = dict(
             iterations=iterations,
             learning_rate=learning_rate,
@@ -778,12 +724,11 @@ class StreamingCatBoostTrainer:
             l2_leaf_reg=self.l2_leaf_reg,
             loss_function=loss,
             eval_metric=loss,
-            random_seed=42,
+            random_seed=Config.SEED,
             task_type=task_type,
             verbose=False,
             allow_writing_files=False,
         )
-
         if task_type == "GPU":
             params["devices"] = "0"
             params["bootstrap_type"] = "Bernoulli"
@@ -793,242 +738,195 @@ class StreamingCatBoostTrainer:
             params["rsm"] = 0.8
             params["bootstrap_type"] = "Bernoulli"
             params["subsample"] = self.subsample
-
         return CatBoostRegressor(**params)
 
     def _compute_directional_accuracy(self, val_df, X_val):
-        try:
-            if "close" not in val_df.columns:
-                return None
-
-            raw_predictions = self.model.predict(X_val)
-            raw_predictions = np.asarray(raw_predictions)
-
-            if raw_predictions.ndim == 1:
-                median_predictions = raw_predictions
-            else:
-                median_predictions = raw_predictions[:, Config.MEDIAN_QUANTILE_INDEX]
-
-            last_close = val_df["close"].to_numpy()
-            actual_target = val_df["target"].to_numpy()
-
-            actual_direction = np.sign(actual_target - last_close)
-            predicted_direction = np.sign(median_predictions - last_close)
-
-            valid_mask = actual_direction != 0
-            if valid_mask.sum() == 0:
-                return None
-
-            matches = (actual_direction == predicted_direction) & valid_mask
-            accuracy = matches.sum() / valid_mask.sum()
-
-            return float(accuracy)
-
-        except Exception as exc:
-            self._log(f"⚠️ Could not compute directional accuracy: {exc}")
+        if "close" not in val_df.columns:
             return None
 
-    def train_single_timeframe(
-        self,
-        data,
-        feature_cols,
-        timeframe,
-        iterations=None,
-        learning_rate=0.05,
-        depth=None,
-        **kwargs,
-    ):
-        try:
-            self.stop_flag = False
-            self.timeframe = timeframe
+        raw_predictions = np.asarray(self.model.predict(X_val))
+        if raw_predictions.ndim == 1:
+            median_predictions = raw_predictions
+        else:
+            median_predictions = raw_predictions[:, Config.MEDIAN_QUANTILE_INDEX]
 
-            tf_params = Config.TIMEFRAME_HYPERPARAMS.get(timeframe, {})
-            if iterations is None:
-                iterations = tf_params.get("iterations", self.iterations)
-            if depth is None:
-                depth = tf_params.get("depth", self.depth)
-            self.l2_leaf_reg = tf_params.get("l2_leaf_reg", self.l2_leaf_reg)
+        last_close = val_df["close"].to_numpy()
+        actual_target = val_df["target"].to_numpy()
+        actual_direction = np.sign(actual_target - last_close)
+        predicted_direction = np.sign(median_predictions - last_close)
+        valid_mask = actual_direction != 0
+        if valid_mask.sum() == 0:
+            return None
+        return float(((actual_direction == predicted_direction) & valid_mask).sum() / valid_mask.sum())
 
-            if len(data) == 0:
-                raise ValueError("Prepared dataframe is empty")
+    def train_single_timeframe(self, data, feature_cols, timeframe, iterations=None, learning_rate=0.05, depth=None, **kwargs):
+        self.stop_flag = False
+        self.timeframe = timeframe
 
-            train_df, val_df = self._chronological_split(data)
+        tf_params = Config.TIMEFRAME_HYPERPARAMS.get(timeframe, {})
+        if iterations is None:
+            iterations = tf_params.get("iterations", self.iterations)
+        if depth is None:
+            depth = tf_params.get("depth", self.depth)
+        self.l2_leaf_reg = tf_params.get("l2_leaf_reg", self.l2_leaf_reg)
 
-            if len(train_df) == 0 or len(val_df) == 0:
-                raise ValueError("Train/validation split produced an empty set")
+        if len(data) == 0:
+            raise ValueError("Prepared dataframe is empty")
 
-            x_columns = feature_cols + ["group_id"]
-            cat_feature_names = ["group_id"]
+        train_df, val_df = self._chronological_split(data)
+        if len(train_df) == 0 or len(val_df) == 0:
+            raise ValueError("Train/validation split produced an empty set")
 
-            X_train = train_df[x_columns]
-            y_train = train_df["target"]
-            X_val = val_df[x_columns]
-            y_val = val_df["target"]
+        x_columns = feature_cols + ["group_id"]
+        cat_feature_names = ["group_id"]
 
-            self._log(f"📊 [{timeframe}] Training rows: {len(train_df):,}")
-            self._log(f"📊 [{timeframe}] Validation rows: {len(val_df):,}")
-            self._log(f"⚙️ [{timeframe}] depth={depth}, iterations={iterations}, l2={self.l2_leaf_reg}")
+        X_train = train_df[x_columns]
+        y_train = train_df["target"]
+        X_val = val_df[x_columns]
+        y_val = val_df["target"]
 
-            train_pool = Pool(X_train, y_train, cat_features=cat_feature_names)
-            val_pool = Pool(X_val, y_val, cat_features=cat_feature_names)
+        self._log(f"📊 [{timeframe}] Training rows: {len(train_df):,}")
+        self._log(f"📊 [{timeframe}] Validation rows: {len(val_df):,}")
+        self._log(f"⚙️ [{timeframe}] depth={depth}, iterations={iterations}, l2={self.l2_leaf_reg}")
 
-            last_error = None
-            fitted_model = None
-            used_task_type = None
+        train_pool = Pool(X_train, y_train, cat_features=cat_feature_names)
+        val_pool = Pool(X_val, y_val, cat_features=cat_feature_names)
 
-            for task_type in self.gpu_manager.preferred_task_types():
-                if self.stop_flag:
-                    break
+        last_error = None
+        fitted_model = None
+        used_task_type = None
 
-                model = self._build_model(task_type, iterations, learning_rate, depth)
-
-                self._log(f"🚀 [{timeframe}] Attempting training on task_type='{task_type}'...")
-
-                try:
-                    model.fit(
-                        train_pool,
-                        eval_set=val_pool,
-                        early_stopping_rounds=Config.EARLY_STOPPING_ROUNDS,
-                        use_best_model=True,
-                        verbose=False,
-                    )
-                    fitted_model = model
-                    used_task_type = task_type
-                    break
-                except Exception as exc:
-                    last_error = exc
-                    self._log(
-                        f"⚠️ [{timeframe}] task_type='{task_type}' failed "
-                        f"({exc}); falling back..."
-                    )
-                    continue
-
-            if fitted_model is None:
-                raise last_error or RuntimeError("No task_type succeeded in training")
-
-            self.model = fitted_model
-            self.task_type_used = used_task_type
-            self._log(f"✅ [{timeframe}] Trained using task_type='{used_task_type}'")
-
-            best_iteration = self.model.get_best_iteration()
-            if best_iteration is None:
-                best_iteration = iterations
-
-            best_score = None
-            best_score_dict = self.model.get_best_score()
-            if best_score_dict:
-                validation_scores = best_score_dict.get("validation", {})
-                if validation_scores:
-                    best_score = next(iter(validation_scores.values()))
-
-            directional_accuracy = self._compute_directional_accuracy(val_df, X_val)
-
-            if directional_accuracy is not None:
-                self._log(
-                    f"🎯 [{timeframe}] Directional accuracy on validation set: "
-                    f"{directional_accuracy * 100:.1f}% (50% = coin flip)"
+        for task_type in self.gpu_manager.preferred_task_types():
+            if self.stop_flag:
+                break
+            model = self._build_model(task_type, iterations, learning_rate, depth)
+            self._log(f"🚀 [{timeframe}] Attempting training on task_type='{task_type}'...")
+            try:
+                model.fit(
+                    train_pool,
+                    eval_set=val_pool,
+                    early_stopping_rounds=Config.EARLY_STOPPING_ROUNDS,
+                    use_best_model=True,
+                    verbose=False,
                 )
+                fitted_model = model
+                used_task_type = task_type
+                break
+            except Exception as exc:
+                last_error = exc
+                self._log(f"⚠️ [{timeframe}] task_type='{task_type}' failed: {exc}")
 
-            self.training_history = {
-                "timeframe": timeframe,
-                "task_type_used": used_task_type,
-                "best_iteration": best_iteration,
-                "best_score": best_score,
-                "train_rows": len(train_df),
-                "val_rows": len(val_df),
-                "depth": depth,
-                "iterations": iterations,
-                "l2_leaf_reg": self.l2_leaf_reg,
-                "directional_accuracy": directional_accuracy,
-            }
+        if fitted_model is None:
+            raise last_error if last_error else RuntimeError("No task_type succeeded in training")
 
-            self.is_trained = True
+        self.model = fitted_model
+        self.task_type_used = used_task_type
+        self._log(f"✅ [{timeframe}] Trained using task_type='{used_task_type}'")
 
-            self._log(
-                f"🏁 [{timeframe}] Training complete "
-                f"(task_type={used_task_type}, best_iter={best_iteration}, val_loss={best_score})"
-            )
+        best_iteration = self.model.get_best_iteration()
+        if best_iteration is None:
+            best_iteration = iterations
 
-            return True
+        best_score = None
+        best_score_dict = self.model.get_best_score()
+        if best_score_dict:
+            validation_scores = best_score_dict.get("validation", {})
+            if validation_scores:
+                best_score = next(iter(validation_scores.values()))
 
-        except Exception as exc:
-            self._log(f"❌ [{timeframe}] Training error: {exc}")
-            traceback.print_exc()
-            return False
+        directional_accuracy = self._compute_directional_accuracy(val_df, X_val)
+        if directional_accuracy is not None:
+            self._log(f"🎯 [{timeframe}] Directional accuracy: {directional_accuracy * 100:.1f}% (50% = coin flip)")
+
+        self.training_history = {
+            "timeframe": timeframe,
+            "task_type_used": used_task_type,
+            "best_iteration": best_iteration,
+            "best_score": best_score,
+            "train_rows": len(train_df),
+            "val_rows": len(val_df),
+            "depth": depth,
+            "iterations": iterations,
+            "l2_leaf_reg": self.l2_leaf_reg,
+            "directional_accuracy": directional_accuracy,
+        }
+        self.is_trained = True
+        self._log(f"🏁 [{timeframe}] Training complete (task_type={used_task_type}, best_iter={best_iteration}, val_loss={best_score})")
+        return True
 
     def save_model(self, model_dir, filename_stem, feature_cols, horizon, timeframe):
         if not self.is_trained or self.model is None:
             self._log("⚠️ No trained model available")
             return False
 
-        try:
-            output_dir = Path(model_dir)
-            output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = Path(model_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-            model_path = output_dir / f"{filename_stem}{Config.MODEL_EXT}"
-            metadata_path = output_dir / f"{filename_stem}{Config.METADATA_EXT}"
+        model_path = output_dir / f"{filename_stem}{Config.MODEL_EXT}"
+        metadata_path = output_dir / f"{filename_stem}{Config.METADATA_EXT}"
 
-            self.model.save_model(str(model_path), format="cbm")
+        self.model.save_model(str(model_path), format="cbm")
 
-            metadata = {
-                "model_type": "catboost.CatBoostRegressor",
-                "timeframe": timeframe,
-                "model_path": str(model_path),
-                "feature_columns": feature_cols,
-                "categorical_features": ["group_id"],
-                "task_type_used": self.task_type_used,
-                "horizon": horizon,
-                "quantiles": self.quantiles,
-                "median_quantile_index": Config.MEDIAN_QUANTILE_INDEX,
-                "directional_accuracy": self.training_history.get("directional_accuracy"),
-                "training_history": self.training_history,
-                "training_time": datetime.now().isoformat(),
-            }
+        metadata = {
+            "model_type": "catboost.CatBoostRegressor",
+            "timeframe": timeframe,
+            "model_path": str(model_path),
+            "feature_columns": feature_cols,
+            "categorical_features": ["group_id"],
+            "task_type_used": self.task_type_used,
+            "horizon": horizon,
+            "quantiles": self.quantiles,
+            "median_quantile_index": Config.MEDIAN_QUANTILE_INDEX,
+            "directional_accuracy": self.training_history.get("directional_accuracy"),
+            "training_history": self.training_history,
+            "training_time": datetime.now().isoformat(),
+        }
+        with open(metadata_path, "wb") as file:
+            pickle.dump(metadata, file)
 
-            with open(metadata_path, "wb") as file:
-                pickle.dump(metadata, file)
-
-            self._log(f"✅ CatBoost model saved: {model_path}")
-            self._log(f"✅ Metadata saved: {metadata_path}")
-
-            return True
-
-        except Exception as exc:
-            self._log(f"❌ Save error: {exc}")
-            traceback.print_exc()
-            return False
+        self._log(f"✅ CatBoost model saved: {model_path}")
+        self._log(f"✅ Metadata saved: {metadata_path}")
+        return True
 
 
 class CatBoostTrainerGUI(CTk):
-    # 16 indicators in A-Z order, 6 per row
+    INI_PATH = Path(__file__).with_suffix(".ini")
+
     INDICATOR_CONFIG = [
         ("ADX", "enable_adx", True),
         ("ATR", "enable_atr", True),
         ("BB", "enable_bb", True),
-        ("CCI", "enable_cci", True),      # was False
+        ("CCI", "enable_cci", True),
         ("EMA", "enable_ema", True),
-        ("KC", "enable_kc", True),        # was False
+        ("KC", "enable_kc", True),
         ("MACD", "enable_macd", True),
-        ("MFI", "enable_mfi", True),      # was False
-        ("OBV", "enable_obv", True),      # was False
-        ("ROC", "enable_roc", True),      # was False
+        ("MFI", "enable_mfi", True),
+        ("OBV", "enable_obv", True),
+        ("ROC", "enable_roc", True),
         ("RSI", "enable_rsi", True),
         ("SMA", "enable_sma", True),
         ("STOCH", "enable_stochastic", True),
-        ("VOL_MA", "enable_vol_ma", True), # was False
-        ("VWAP", "enable_vwap", True),     # was False
-        ("WILLR", "enable_willr", True),   # was False
+        ("VOL_MA", "enable_vol_ma", True),
+        ("VWAP", "enable_vwap", True),
+        ("WILLR", "enable_willr", True),
     ]
 
     def __init__(self):
         super().__init__()
-
         self.title(Config.APP_TITLE)
         self.geometry(Config.APP_GEOMETRY)
         self.resizable(False, False)
+        self._is_closing = False
+
+        # Hide window while we build the UI and restore saved geometry,
+        # so the user never sees the default position/size flash before
+        # the saved position is applied.
+        self.withdraw()
 
         self.gui_logger = GUILogger()
         self.gui_logger.enable_console_redirect()
+
+        self.gpu_manager = GPUManager(verbose=False, log_callback=self.gui_logger.log)
 
         self.csv_folder = Config.DATASET_DIR
         self.model_folder = Config.MODEL_DIR
@@ -1041,10 +939,92 @@ class CatBoostTrainerGUI(CTk):
         self.current_trainer = None
 
         self._create_ui()
+        self._load_state()  # applied while window is hidden
         self.gui_logger.set_log_widget(self.log_text)
-        self.after(500, self.scan_data_source)
 
+        self.gpu_manager.log_system_info()
+
+        self.after(500, self.scan_data_source)
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
+
+        # Flush pending geometry/layout work, then reveal the window.
+        self.update_idletasks()
+        self.deiconify()
+
+    def _load_state(self):
+        if not self.INI_PATH.exists():
+            return
+        cp = configparser.ConfigParser()
+        cp.read(str(self.INI_PATH))
+
+        if cp.has_section("window"):
+            geom = cp.get("window", "geometry", fallback="")
+            if geom:
+                # wm_geometry() is frame-relative and round-trips exactly
+                # through self.geometry() - no title-bar drift.
+                self.geometry(geom)
+            else:
+                # Legacy ini stored only x/y from winfo_x/winfo_y (client coords).
+                # On Windows this caused a ~37px downward creep per launch.
+                # Fall back to size only to break the drift loop.
+                x = cp.get("window", "x", fallback="")
+                y = cp.get("window", "y", fallback="")
+                if x and y:
+                    try:
+                        self.geometry(Config.APP_GEOMETRY)
+                    except Exception:
+                        pass
+
+        if cp.has_section("paths"):
+            csv = cp.get("paths", "csv_folder", fallback="")
+            model = cp.get("paths", "model_folder", fallback="")
+            if csv:
+                self.csv_path_var.set(csv)
+                self.csv_folder = Path(csv)
+            if model:
+                self.model_path_var.set(model)
+                self.model_folder = Path(model)
+
+        if cp.has_section("params"):
+            self.horizon.set(cp.get("params", "horizon", fallback=str(Config.DEFAULT_HORIZON)))
+            self.iterations.set(cp.get("params", "iterations", fallback=str(Config.DEFAULT_ITERATIONS)))
+            self.learning_rate.set(cp.get("params", "learning_rate", fallback=str(Config.DEFAULT_LEARNING_RATE)))
+            self.depth.set(cp.get("params", "depth", fallback=str(Config.DEFAULT_DEPTH)))
+            self.auto_tune_var.set(cp.getboolean("params", "auto_tune", fallback=True))
+
+        if cp.has_section("features"):
+            self.feature_cols_var.set(cp.get("features", "base_features", fallback="time,open,high,low,close,tick_volume"))
+
+        if cp.has_section("timeframes"):
+            for tf in Config.TIMEFRAMES:
+                if tf in self.tf_vars:
+                    self.tf_vars[tf].set(cp.getboolean("timeframes", tf, fallback=True))
+
+        if cp.has_section("indicators"):
+            for var_name in self.indicator_vars:
+                self.indicator_vars[var_name].set(cp.getboolean("indicators", var_name, fallback=True))
+
+    def _save_state(self):
+        cp = configparser.ConfigParser()
+        # Store wm_geometry() directly. It is frame-relative (same coordinate
+        # system that geometry() consumes), so a save/restore round-trip is
+        # exact. Using winfo_x()/winfo_y() instead caused the ~37px downward
+        # creep per launch because those return client-area coords.
+        cp["window"] = {"geometry": self.wm_geometry()}
+        cp["paths"] = {"csv_folder": str(self.csv_path_var.get()), "model_folder": str(self.model_path_var.get())}
+        cp["params"] = {
+            "horizon": self.horizon.get(),
+            "iterations": self.iterations.get(),
+            "learning_rate": self.learning_rate.get(),
+            "depth": self.depth.get(),
+            "auto_tune": str(self.auto_tune_var.get()),
+        }
+        cp["features"] = {"base_features": self.feature_cols_var.get()}
+        cp["timeframes"] = {tf: str(var.get()) for tf, var in self.tf_vars.items()}
+        cp["indicators"] = {k: str(v.get()) for k, v in self.indicator_vars.items()}
+
+        with open(self.INI_PATH, "w") as f:
+            cp.write(f)
 
     def _create_ui(self):
         main_frame = CTkFrame(self, fg_color="transparent")
@@ -1054,8 +1034,8 @@ class CatBoostTrainerGUI(CTk):
         title_frame.pack(fill="x", pady=(0, 5))
 
         CTkLabel(title_frame, text="Copyright Su Nie | BSD-3C License | https://github.com/can87683", font=("Ubuntu", 16), text_color="yellow").pack(pady=(0, 4))
-        CTkLabel(title_frame, text="🎯 CatBoost Model Trainer (per timeframe)",
-                 font=("Ubuntu", 20, "bold")).pack(pady=6)
+
+        CTkLabel(title_frame, text="🎯 CatBoost Model Trainer (per timeframe)", font=("Ubuntu", 20, "bold")).pack(pady=6)
 
         self.usage_row = UsageRow(main_frame)
 
@@ -1076,13 +1056,11 @@ class CatBoostTrainerGUI(CTk):
         folder_frame = CTkFrame(frame, fg_color="transparent")
         folder_frame.pack(fill="x", padx=10, pady=4)
 
-        self.select_csv_btn = CTkButton(folder_frame, text="📁 CSV Folder",
-                                         command=self.select_csv_folder, width=130, height=30)
+        self.select_csv_btn = CTkButton(folder_frame, text="📁 CSV Folder", command=self.select_csv_folder, width=130, height=30)
         self.select_csv_btn.pack(side="left", padx=(0, 8))
 
         self.csv_path_var = tk.StringVar(value=str(self.csv_folder))
-        csv_entry = CTkEntry(folder_frame, textvariable=self.csv_path_var, state="readonly", height=30)
-        csv_entry.pack(side="left", fill="x", expand=True)
+        CTkEntry(folder_frame, textvariable=self.csv_path_var, state="readonly", height=30).pack(side="left", fill="x", expand=True)
 
     def _create_model_folder_section(self, parent):
         frame = CTkFrame(parent, corner_radius=8)
@@ -1091,13 +1069,11 @@ class CatBoostTrainerGUI(CTk):
         folder_frame = CTkFrame(frame, fg_color="transparent")
         folder_frame.pack(fill="x", padx=10, pady=4)
 
-        self.select_model_btn = CTkButton(folder_frame, text="📁 Model Folder",
-                                           command=self.select_model_folder, width=130, height=30)
+        self.select_model_btn = CTkButton(folder_frame, text="📁 Model Folder", command=self.select_model_folder, width=130, height=30)
         self.select_model_btn.pack(side="left", padx=(0, 8))
 
         self.model_path_var = tk.StringVar(value=str(self.model_folder))
-        model_entry = CTkEntry(folder_frame, textvariable=self.model_path_var, state="readonly", height=30)
-        model_entry.pack(side="left", fill="x", expand=True)
+        CTkEntry(folder_frame, textvariable=self.model_path_var, state="readonly", height=30).pack(side="left", fill="x", expand=True)
 
         self.status_label = CTkLabel(frame, text="📊 Status: No folder selected", font=("Ubuntu", 11))
         self.status_label.pack(anchor="w", padx=10, pady=2)
@@ -1116,19 +1092,15 @@ class CatBoostTrainerGUI(CTk):
 
         row = CTkFrame(param_frame, fg_color="transparent")
         row.pack(fill="x", pady=2)
-
         for col in range(8):
             row.grid_columnconfigure(col, weight=1 if col % 2 else 0)
 
         CTkLabel(row, text="Horizon:", width=80).grid(row=0, column=0, padx=(0, 4), sticky="w")
         CTkEntry(row, textvariable=self.horizon, width=70).grid(row=0, column=1, padx=(0, 12), sticky="w")
-
         CTkLabel(row, text="Iterations:", width=80).grid(row=0, column=2, padx=(0, 4), sticky="w")
         CTkEntry(row, textvariable=self.iterations, width=70).grid(row=0, column=3, padx=(0, 12), sticky="w")
-
         CTkLabel(row, text="LR:", width=80).grid(row=0, column=4, padx=(0, 4), sticky="w")
         CTkEntry(row, textvariable=self.learning_rate, width=70).grid(row=0, column=5, padx=(0, 12), sticky="w")
-
         CTkLabel(row, text="Depth:", width=80).grid(row=0, column=6, padx=(0, 4), sticky="w")
         CTkEntry(row, textvariable=self.depth, width=70).grid(row=0, column=7, sticky="w")
 
@@ -1146,12 +1118,9 @@ class CatBoostTrainerGUI(CTk):
         feature_frame = CTkFrame(frame, fg_color="transparent")
         feature_frame.pack(fill="x", padx=10, pady=4)
 
-        default_features = "time,open,high,low,close,volume"
-        self.feature_cols_var = tk.StringVar(value=default_features)
-
+        self.feature_cols_var = tk.StringVar(value="time,open,high,low,close,tick_volume")
         CTkLabel(feature_frame, text="Base Features (comma-separated):", font=("Ubuntu", 11)).pack(anchor="w", pady=(0, 3))
-        feature_entry = CTkEntry(feature_frame, textvariable=self.feature_cols_var, height=30)
-        feature_entry.pack(fill="x", pady=(0, 3))
+        CTkEntry(feature_frame, textvariable=self.feature_cols_var, height=30).pack(fill="x", pady=(0, 3))
 
     def _create_timeframes_section(self, parent):
         frame = CTkFrame(parent, corner_radius=8)
@@ -1165,13 +1134,10 @@ class CatBoostTrainerGUI(CTk):
         self.tf_vars = {}
         checkboxes_frame = CTkFrame(tf_frame, fg_color="transparent")
         checkboxes_frame.pack(fill="x")
-
         for i, tf in enumerate(Config.TIMEFRAMES):
             var = tk.BooleanVar(value=True)
             self.tf_vars[tf] = var
-            ctk.CTkCheckBox(checkboxes_frame, text=tf, variable=var, width=80).grid(
-                row=0, column=i, padx=4, sticky="w"
-            )
+            ctk.CTkCheckBox(checkboxes_frame, text=tf, variable=var, width=80).grid(row=0, column=i, padx=4, sticky="w")
 
     def _create_indicators_section(self, parent):
         frame = CTkFrame(parent, corner_radius=8)
@@ -1183,22 +1149,14 @@ class CatBoostTrainerGUI(CTk):
         CTkLabel(indicator_frame, text="Technical Indicators (A-Z, 6 per row):", font=("Ubuntu", 11)).pack(anchor="w", pady=(0, 3))
 
         self.indicator_vars = {}
-
-        # Build rows of 6
         rows = [self.INDICATOR_CONFIG[i:i+6] for i in range(0, len(self.INDICATOR_CONFIG), 6)]
-        for r_idx, row_items in enumerate(rows):
+        for row_items in rows:
             row_frame = CTkFrame(indicator_frame, fg_color="transparent")
             row_frame.pack(fill="x", pady=1)
             for c_idx, (label, var_name, default) in enumerate(row_items):
                 var = tk.BooleanVar(value=default)
                 self.indicator_vars[var_name] = var
-                ctk.CTkCheckBox(
-                    row_frame,
-                    text=label,
-                    variable=var,
-                    width=90,
-                    font=("Ubuntu", 11),
-                ).grid(row=0, column=c_idx, padx=6, sticky="w")
+                ctk.CTkCheckBox(row_frame, text=label, variable=var, width=90, font=("Ubuntu", 11)).grid(row=0, column=c_idx, padx=6, sticky="w")
 
         CTkLabel(
             indicator_frame,
@@ -1214,16 +1172,18 @@ class CatBoostTrainerGUI(CTk):
         button_frame = CTkFrame(frame, fg_color="transparent")
         button_frame.pack(pady=6)
 
-        self.train_btn = CTkButton(button_frame, text="🚀 Start Training",
-                                    command=self.start_training, width=140, height=38,
-                                    fg_color="#2e7d32", hover_color="#1b5e20",
-                                    font=("Ubuntu", 13, "bold"))
+        self.train_btn = CTkButton(
+            button_frame, text="🚀 Start Training", command=self.start_training,
+            width=140, height=38, fg_color="#2e7d32", hover_color="#1b5e20",
+            font=("Ubuntu", 13, "bold"),
+        )
         self.train_btn.pack(side="left", padx=5)
 
-        self.stop_btn = CTkButton(button_frame, text="⏹️ Stop Training",
-                                   command=self.stop_training, width=140, height=38,
-                                   fg_color="#c62828", hover_color="#b71c1c",
-                                   font=("Ubuntu", 13, "bold"), state="disabled")
+        self.stop_btn = CTkButton(
+            button_frame, text="⏹️ Stop Training", command=self.stop_training,
+            width=140, height=38, fg_color="#c62828", hover_color="#b71c1c",
+            font=("Ubuntu", 13, "bold"), state="disabled",
+        )
         self.stop_btn.pack(side="left", padx=5)
 
     def _create_status_section(self, parent):
@@ -1239,10 +1199,12 @@ class CatBoostTrainerGUI(CTk):
         frame = CTkFrame(parent, corner_radius=8)
         frame.pack(fill="both", expand=True)
 
-        self.log_text = CTkTextbox(frame, font=("Ubuntu Mono", 11))
+        self.log_text = CTkTextbox(frame, font=("Ubuntu Mono", 12))
         self.log_text.pack(fill="both", expand=True, padx=10, pady=4)
 
     def update_status(self, message):
+        if self._is_closing:
+            return
         self.status_text.configure(state="normal")
         self.status_text.delete("1.0", "end")
         self.status_text.insert("1.0", message)
@@ -1259,10 +1221,9 @@ class CatBoostTrainerGUI(CTk):
         folder = filedialog.askdirectory(title="Select Model Save Folder", initialdir=str(self.model_folder))
         if folder:
             self.model_path_var.set(folder)
-            global MODEL_DIR
-            MODEL_DIR = Path(folder)
-            MODEL_DIR.mkdir(parents=True, exist_ok=True)
-            self.gui_logger.log(f"💾 Model folder set to: {MODEL_DIR}")
+            self.model_folder = Path(folder)
+            self.model_folder.mkdir(parents=True, exist_ok=True)
+            self.gui_logger.log(f"💾 Model folder set to: {self.model_folder}")
 
     def scan_data_source(self):
         csv_folder = Path(self.csv_path_var.get())
@@ -1283,7 +1244,6 @@ class CatBoostTrainerGUI(CTk):
 
         self.available_symbols = [s[0] for s in symbols]
         self.available_timeframes = timeframes
-
         self.status_label.configure(text=f"✅ Found {len(symbols)} symbols, {len(timeframes)} timeframes")
         self.gui_logger.log(f"✅ Loaded {len(symbols)} symbols", "success")
         self.train_btn.configure(state="normal")
@@ -1309,111 +1269,95 @@ class CatBoostTrainerGUI(CTk):
         self.stop_btn.configure(state="normal")
 
         def training_task():
-            try:
-                self.gui_logger.log("=" * 60)
-                self.gui_logger.log("🚀 Starting Per-Timeframe CatBoost Training")
-                self.gui_logger.log("=" * 60)
-                self.gui_logger.log(f"📂 CSV Folder: {csv_folder}")
-                self.gui_logger.log(
-                    f"💾 System RAM: {MemoryOptimizer.get_system_memory_available_gb():.1f} GB available"
+            self.gui_logger.log("=" * 60)
+            self.gui_logger.log("🚀 Starting Per-Timeframe CatBoost Training")
+            self.gui_logger.log("=" * 60)
+            self.gui_logger.log(f"📂 CSV Folder: {csv_folder}")
+            self.gui_logger.log(f"💾 System RAM: {MemoryOptimizer.get_system_memory_available_gb():.1f} GB available")
+
+            flags = {name: var.get() for name, var in self.indicator_vars.items()}
+            enabled = [name.replace("enable_", "").upper() for name, val in flags.items() if val]
+            self.gui_logger.log(f"📊 Indicators enabled ({len(enabled)}): {', '.join(enabled)}")
+
+            self.data_preparer.set_indicator_flags(**flags)
+
+            feature_input = self.feature_cols_var.get().strip()
+            if feature_input:
+                feature_cols = [f.strip() for f in feature_input.split(',') if f.strip()]
+            else:
+                feature_cols = Config.DEFAULT_FEATURES
+
+            horizon = int(self.horizon.get())
+            learning_rate = float(self.learning_rate.get())
+            gui_iterations = int(self.iterations.get())
+            gui_depth = int(self.depth.get())
+            auto_tune = self.auto_tune_var.get()
+            model_folder = self.model_path_var.get()
+
+            results = {}
+
+            for timeframe in selected_timeframes:
+                if self.stop_flag or self._is_closing:
+                    self.gui_logger.log("⏹️ Training stopped by user", "warning")
+                    break
+
+                self.gui_logger.log("-" * 60)
+                self.gui_logger.log(f"▶️ Timeframe: {timeframe}")
+                self.update_status(f"[{timeframe}] Building dataset...")
+
+                data = self.data_preparer.build_dataframe_for_timeframe(
+                    csv_folder=csv_folder,
+                    feature_cols=feature_cols,
+                    horizon=horizon,
+                    timeframe=timeframe,
                 )
 
-                # Collect all indicator flags from GUI checkboxes
-                flags = {name: var.get() for name, var in self.indicator_vars.items()}
-                enabled = [name.replace("enable_", "").upper() for name, val in flags.items() if val]
-                self.gui_logger.log(f"📊 Indicators enabled ({len(enabled)}): {', '.join(enabled)}")
+                feature_columns = self.data_preparer.feature_cols
+                self.update_status(f"[{timeframe}] Training CatBoost model...")
 
-                self.data_preparer.set_indicator_flags(**flags)
+                trainer = StreamingCatBoostTrainer(self.gui_logger.log, timeframe=timeframe)
+                self.current_trainer = trainer
 
-                feature_input = self.feature_cols_var.get().strip()
-                if feature_input:
-                    feature_cols = [f.strip() for f in feature_input.split(',') if f.strip()]
-                else:
-                    feature_cols = Config.DEFAULT_FEATURES
+                success = trainer.train_single_timeframe(
+                    data=data,
+                    feature_cols=feature_columns,
+                    timeframe=timeframe,
+                    iterations=None if auto_tune else gui_iterations,
+                    learning_rate=learning_rate,
+                    depth=None if auto_tune else gui_depth,
+                )
 
-                horizon = int(self.horizon.get())
-                learning_rate = float(self.learning_rate.get())
-
-                gui_iterations = int(self.iterations.get())
-                gui_depth = int(self.depth.get())
-                auto_tune = self.auto_tune_var.get()
-
-                model_folder = self.model_path_var.get()
-
-                results = {}
-
-                for timeframe in selected_timeframes:
-                    if self.stop_flag:
-                        self.gui_logger.log("⏹️ Training stopped by user", "warning")
-                        break
-
-                    self.gui_logger.log("-" * 60)
-                    self.gui_logger.log(f"▶️ Timeframe: {timeframe}")
-                    self.update_status(f"[{timeframe}] Building dataset...")
-
-                    try:
-                        data = self.data_preparer.build_dataframe_for_timeframe(
-                            csv_folder=csv_folder,
-                            feature_cols=feature_cols,
-                            horizon=horizon,
-                            timeframe=timeframe,
-                        )
-                    except ValueError as exc:
-                        self.gui_logger.log(f"⚠️ [{timeframe}] Skipped: {exc}", "warning")
-                        results[timeframe] = "skipped (no data)"
-                        continue
-
-                    feature_columns = self.data_preparer.feature_cols
-
-                    self.update_status(f"[{timeframe}] Training CatBoost model...")
-
-                    trainer = StreamingCatBoostTrainer(self.gui_logger.log, timeframe=timeframe)
-                    self.current_trainer = trainer
-
-                    success = trainer.train_single_timeframe(
-                        data=data,
+                if success and not trainer.stop_flag:
+                    filename_stem = f"{Config.MODEL_PREFIX}_{timeframe}"
+                    if trainer.save_model(
+                        model_dir=model_folder,
+                        filename_stem=filename_stem,
                         feature_cols=feature_columns,
+                        horizon=horizon,
                         timeframe=timeframe,
-                        iterations=None if auto_tune else gui_iterations,
-                        learning_rate=learning_rate,
-                        depth=None if auto_tune else gui_depth,
-                    )
-
-                    if success and not trainer.stop_flag:
-                        filename_stem = f"{Config.MODEL_PREFIX}_{timeframe}"
-                        if trainer.save_model(
-                            model_dir=model_folder,
-                            filename_stem=filename_stem,
-                            feature_cols=feature_columns,
-                            horizon=horizon,
-                            timeframe=timeframe,
-                        ):
-                            self.gui_logger.log(f"✅ [{timeframe}] Model saved: {filename_stem}{Config.MODEL_EXT}", "success")
-                            results[timeframe] = f"trained ({trainer.task_type_used})"
-                        else:
-                            results[timeframe] = "failed to save"
-                    elif trainer.stop_flag:
-                        results[timeframe] = "stopped"
-                        self.stop_flag = True
+                    ):
+                        self.gui_logger.log(f"✅ [{timeframe}] Model saved: {filename_stem}{Config.MODEL_EXT}", "success")
+                        results[timeframe] = f"trained ({trainer.task_type_used})"
                     else:
-                        results[timeframe] = "training failed"
+                        results[timeframe] = "failed to save"
+                elif trainer.stop_flag:
+                    results[timeframe] = "stopped"
+                    self.stop_flag = True
+                else:
+                    results[timeframe] = "training failed"
 
-                    del trainer
-                    self.current_trainer = None
-                    MemoryOptimizer.clear_cache()
-
-                summary = ", ".join(f"{tf}: {status}" for tf, status in results.items())
-                self.gui_logger.log("=" * 60)
-                self.gui_logger.log(f"🏁 Summary: {summary}")
-                self.update_status(f"Done. {summary}")
-
-            except Exception as e:
-                self.gui_logger.log(f"❌ Training error: {e}", "error")
-                traceback.print_exc()
-                self.update_status(f"Error: {e}")
-            finally:
-                self.is_training = False
+                del trainer
                 self.current_trainer = None
+                MemoryOptimizer.clear_cache()
+
+            summary = ", ".join(f"{tf}: {status}" for tf, status in results.items())
+            self.gui_logger.log("=" * 60)
+            self.gui_logger.log(f"🏁 Summary: {summary}")
+            self.update_status(f"Done. {summary}")
+
+            self.is_training = False
+            self.current_trainer = None
+            if not self._is_closing:
                 self.train_btn.configure(state="normal")
                 self.stop_btn.configure(state="disabled")
 
@@ -1426,28 +1370,33 @@ class CatBoostTrainerGUI(CTk):
         self.gui_logger.log("⏹️ Stopping training...", "warning")
 
     def _on_closing(self):
-        self.gui_logger.disable_console_redirect()
-        if self.is_training:
-            result = messagebox.askyesno(
-                "Training in Progress",
-                "Training is currently running.\n\nDo you want to stop training and quit?",
-                icon='warning',
-            )
-            if result:
-                self.stop_flag = True
-                if self.current_trainer is not None:
-                    self.current_trainer.stop_training()
-                self.after(100, self.destroy)
-        else:
-            result = messagebox.askyesno("Quit", "Do you want to quit AI Predict Train (CatBoost)?")
-            if result:
-                self.destroy()
+        if self._is_closing:
+            return
+        self._is_closing = True
+        self._save_state()
 
+        def do_exit():
+            self.gui_logger.disable_console_redirect()
+            self.destroy()
 
-def main():
-    app = CatBoostTrainerGUI()
-    app.mainloop()
+        def confirm_exit():
+            if self.is_training:
+                if messagebox.askyesno("Training in Progress", "Training is currently running.\n\nDo you want to stop training and quit?", icon='warning'):
+                    self.stop_flag = True
+                    if self.current_trainer is not None:
+                        self.current_trainer.stop_training()
+                    self.after(200, do_exit)
+                else:
+                    self._is_closing = False
+            else:
+                if messagebox.askyesno("Quit", "Do you want to quit AI Predict Train (CatBoost)?"):
+                    do_exit()
+                else:
+                    self._is_closing = False
+
+        self.after(0, confirm_exit)
 
 
 if __name__ == "__main__":
-    main()
+    app = CatBoostTrainerGUI()
+    app.mainloop()
