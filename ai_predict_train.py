@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-# ai_predict_train.py
+# ai_menu.py
+# Copyright Su Nie | BSD-3C License | https://github.com/can87683
+
 """
 pip requirements (A=Z): customtkinter, GPUtil, psutil, setproctitle
 """
@@ -45,6 +47,9 @@ class SystemConfig:
 
 
 class IPRow:
+    DOWN_TEXT = "NETWORK DOWN - reconnecting..."
+    UP_TEXT = "NETWORK UP - fetching IPs..."
+
     def __init__(self, parent, gui):
         self.gui = gui
         self.frame = ctk.CTkFrame(parent, fg_color="#222222", height=40)
@@ -56,14 +61,16 @@ class IPRow:
         )
         self.label.pack(expand=True, fill="x")
         self.result_queue = queue.Queue()
-        self.fetch_in_progress = False
+        self.online = None
+        self.last_fetch = 0.0
+        self.worker = None
         self.frame.after(gui.QUEUE_POLL_MS, self.check_queue)
-        self.frame.after(1000, self.update_ip_label)
+        self.frame.after(1000, self.poll)
 
     def get_lan_ip(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(0.5)
-        s.connect(("8.8.8.8", 80))
+        s.connect((self.gui.PROBE_HOST, 80))
         ip = s.getsockname()[0]
         s.close()
         return ip
@@ -73,25 +80,42 @@ class IPRow:
         with urllib.request.urlopen(req, timeout=1.5) as response:
             return response.read().decode("utf-8").strip()
 
-    def update_ip_label(self):
-        if self.fetch_in_progress:
-            self.frame.after(self.gui.REFRESH_IP_MS, self.update_ip_label)
+    def poll(self):
+        self.frame.after(self.gui.PROBE_MS, self.poll)
+        if self.worker is not None and self.worker.is_alive():
             return
+        self.worker = threading.Thread(target=self.probe_and_fetch, daemon=True)
+        self.worker.start()
 
-        def fetch():
-            self.fetch_in_progress = True
-            lan = self.get_lan_ip()
-            wan = self.get_public_ip()
-            self.result_queue.put((lan, wan))
-            self.fetch_in_progress = False
-        threading.Thread(target=fetch, daemon=True).start()
-        self.frame.after(self.gui.REFRESH_IP_MS, self.update_ip_label)
+    def probe_and_fetch(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(self.gui.PROBE_TIMEOUT_S)
+        up = s.connect_ex((self.gui.PROBE_HOST, self.gui.PROBE_PORT)) == 0
+        s.close()
+        if not up:
+            self.online = False
+            self.result_queue.put(("down",))
+            return
+        if not self.online:
+            self.result_queue.put(("up",))
+        elif time.monotonic() - self.last_fetch < self.gui.REFRESH_IP_MS / 1000:
+            return
+        lan = self.get_lan_ip()
+        wan = self.get_public_ip()
+        self.last_fetch = time.monotonic()
+        self.online = True
+        self.result_queue.put(("ip", lan, wan))
 
     def check_queue(self):
         try:
             while True:
-                lan, wan = self.result_queue.get_nowait()
-                self.label.configure(text=f"LAN: {lan}   WAN: {wan}")
+                item = self.result_queue.get_nowait()
+                if item[0] == "down":
+                    self.label.configure(text=self.DOWN_TEXT, text_color="red")
+                elif item[0] == "up":
+                    self.label.configure(text=self.UP_TEXT, text_color="orange")
+                else:
+                    self.label.configure(text=f"LAN: {item[1]}   WAN: {item[2]}", text_color="yellow")
         except queue.Empty:
             pass
         self.frame.after(self.gui.QUEUE_POLL_MS, self.check_queue)
@@ -145,16 +169,22 @@ class UsageRow:
         self.frame.after(self.gui.QUEUE_POLL_MS, self.check_queue)
 
 
-class AIMenuGUI:
-    title = "Copyright Su Nie | BSD-3C License | https://github.com/can87683"
+class RunMenuGUI:
+    title = "Run Menu - Copyright Su Nie | BSD-3C License | https://github.com/can87683"
     window_width = 640
     window_height = 300
     IPROW_FONT_SIZE = 26
     USAGE_FONT_SIZE = 20
     LIST_FONT_SIZE = 12
     BUTTON_WIDTH = 24
+
     REFRESH_IP_MS = 60000
     REFRESH_USAGE_MS = 2000
+    PROBE_MS = 2000
+    PROBE_HOST = "1.1.1.1"
+    PROBE_PORT = 80
+    PROBE_TIMEOUT_S = 1.0
+
     QUEUE_POLL_MS = 100
     USAGE_INTERVAL_S = 0.5
     KILL_GRACE_TICKS = 30
@@ -541,5 +571,5 @@ class AIMenuGUI:
 
 if __name__ == "__main__":
     SystemConfig()
-    app = AIMenuGUI()
+    app = RunMenuGUI()
     app.run()
