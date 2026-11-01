@@ -6,26 +6,29 @@
 pip requirements (A=Z): customtkinter, GPUtil, psutil, setproctitle
 """
 
-import setproctitle
 import os
 import sys
+
+import setproctitle
+
 setproctitle.setproctitle(os.path.basename(sys.argv[0]))
 
-import threading
+import configparser
 import queue
-import signal
-import time
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
-import configparser
-import urllib.request
+import threading
+import time
 import tkinter as tk
-from tkinter import messagebox, filedialog
+import urllib.request
+from tkinter import filedialog, messagebox
+
 import customtkinter as ctk
-import psutil
 import GPUtil
+import psutil
 
 
 class SystemConfig:
@@ -170,7 +173,7 @@ class UsageRow:
 
 
 class RunMenuGUI:
-    title = "Run Menu - Copyright Su Nie | BSD-3C License | https://github.com/can87683"
+    title = "Run Menu"
     window_width = 640
     window_height = 300
     IPROW_FONT_SIZE = 26
@@ -192,7 +195,6 @@ class RunMenuGUI:
     max_entries = 500
 
     def __init__(self):
-        # Derive ini filename from the script's actual name
         script_path = os.path.abspath(sys.argv[0])
         script_dir = os.path.dirname(script_path)
         script_name = os.path.splitext(os.path.basename(script_path))[0]
@@ -369,7 +371,7 @@ class RunMenuGUI:
             cwd = os.path.dirname(os.path.abspath(executable)) if os.path.exists(executable) else None
             if executable.endswith('.py'):
                 cmd = [self.python_binary, executable] + args
-            elif executable.endswith('.sh'):
+            elif executable.endswith('.sh') or executable.endswith('.bash'):
                 cmd = ['bash', executable] + args
             else:
                 cmd = [executable] + args
@@ -482,8 +484,14 @@ class RunMenuGUI:
         def open_browser():
             filename = filedialog.askopenfilename(
                 title="Select Script or Binary",
-                filetypes=[("Python Scripts", "*.py"), ("Executables", "*.exe"),
-                           ("Shell Scripts", "*.sh"), ("All Files", "*.*")]
+                filetypes=[
+                    ("All Supported", "*.py *.sh *.bash *.exe *.bat *.cmd"),
+                    ("Python Scripts", "*.py"),
+                    ("Shell Scripts", "*.sh *.bash"),
+                    ("Windows Executables", "*.exe *.bat *.cmd"),
+                    ("Linux Binaries", "*"),
+                    ("All Files", "*")
+                ]
             )
             if filename:
                 entry_data['full_path'] = filename
@@ -524,6 +532,42 @@ class RunMenuGUI:
         if save_immediately:
             self.save_paths_to_config()
 
+    def _to_relative(self, path: str) -> str:
+        """Store path relative to the script folder when possible."""
+        if not path:
+            return path
+        # Preserve command-with-args form: split the executable off, keep the rest.
+        parts = shlex.split(path)
+        executable = parts[0]
+        tail = parts[1:]
+
+        if os.path.isabs(executable):
+            script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+            try:
+                rel = os.path.relpath(executable, script_dir)
+            except ValueError:
+                # Different drive (Windows) — cannot be made relative, keep absolute
+                rel = executable
+            # Only store as relative if it doesn't escape the folder or land on another drive
+            if not rel.startswith("..") and not os.path.isabs(rel):
+                executable = rel
+        return shlex.join([executable] + tail)
+
+    def _to_absolute(self, path: str) -> str:
+        """Resolve a stored path back to an absolute path relative to the script folder."""
+        if not path:
+            return path
+        parts = shlex.split(path)
+        executable = parts[0]
+        tail = parts[1:]
+
+        if not os.path.isabs(executable):
+            script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+            candidate = os.path.normpath(os.path.join(script_dir, executable))
+            executable = candidate
+        return shlex.join([executable] + tail)
+
+
     def save_paths_to_config(self):
         if self.parser.has_section("paths"):
             self.parser.remove_section("paths")
@@ -532,7 +576,7 @@ class RunMenuGUI:
         for i, entry_data in enumerate(self.path_entries):
             path = entry_data['full_path'].strip()
             if path:
-                self.parser["paths"][f"path_{i}"] = path
+                self.parser["paths"][f"path_{i}"] = self._to_relative(path)
 
         self.save()
 
@@ -546,7 +590,7 @@ class RunMenuGUI:
             for key in sorted_keys:
                 path = paths_dict[key]
                 if path and path.strip():
-                    self.add_path_entry(path, save_immediately=False)
+                    self.add_path_entry(self._to_absolute(path), save_immediately=False)
             self.save_paths_to_config()
 
     def on_closing(self):
@@ -557,7 +601,6 @@ class RunMenuGUI:
             if proc is not None and proc.poll() is None:
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         geom = self.root.geometry()
-        # geometry format: WxH+X+Y
         pos_part = geom.split("+", 1)[1]
         x, y = pos_part.split("+")
         self.parser["window"]["x"] = x
