@@ -2,9 +2,10 @@
 # ai_predict_train_tft.py
 # Copyright Su Nie | BSD-3C License | https://github.com/can87683
 
-
+import os
+import sys
 import setproctitle
-setproctitle.setproctitle("ai_predict_train_tft_ctk")
+setproctitle.setproctitle(os.path.basename(sys.argv[0]))
 
 import customtkinter as ctk
 from customtkinter import CTk, CTkFrame, CTkLabel, CTkButton, CTkEntry, CTkTextbox, CTkCheckBox
@@ -19,9 +20,9 @@ import pandas as pd
 import pickle
 import gc
 import psutil
+import queue
+import shutil
 from datetime import datetime
-import sys
-
 import torch
 
 multiprocessing.set_start_method('spawn', force=True)
@@ -34,7 +35,7 @@ from pytorch_forecasting.data.encoders import GroupNormalizer
 
 class Config:
     HOME = Path.home()
-    MODEL_DIR = HOME / "ai_model_ml"
+    MODEL_DIR = HOME / "ai_model_ml_symbol"
     DATASET_DIR = HOME / "mt5_data"
 
     MAX_ROWS_PER_SYMBOL = 5000
@@ -64,15 +65,18 @@ class Config:
     LEARNING_RATE = 0.0005
     GRADIENT_CLIP_NORM = 1.0
 
-    NUM_WORKERS = min(4, multiprocessing.cpu_count() or 4)
+    NUM_WORKERS = 0
+
     TIMEFRAMES = ['M5', 'M15', 'H1', 'H4', 'D1', 'W1']
 
     MODEL_PREFIX = "ai_predict_tft"
     MODEL_EXT = ".ckpt"
     METADATA_EXT = ".pkl"
+    ONNX_EXT = ".onnx"
+    ONNX_OPSET = 14
 
     APP_TITLE = "🚀 TFT Model Trainer"
-    APP_GEOMETRY = "640x1050"
+    APP_GEOMETRY = "640x1020"
     THEME = "dark"
     COLOR_THEME = "dark-blue"
 
@@ -82,17 +86,6 @@ class Config:
     def ensure_directories(cls):
         cls.MODEL_DIR.mkdir(parents=True, exist_ok=True)
         cls.DATASET_DIR.mkdir(parents=True, exist_ok=True)
-
-
-Config.ensure_directories()
-ctk.set_appearance_mode(Config.THEME)
-ctk.set_default_color_theme(Config.COLOR_THEME)
-
-HOME = Config.HOME
-MODEL_DIR = Config.MODEL_DIR
-DATASET_DIR = Config.DATASET_DIR
-
-pl.seed_everything(Config.SEED, workers=True)
 
 
 class GPUManager:
@@ -407,34 +400,107 @@ class FeatureEngineer:
 
 class GUILogger:
     def __init__(self):
-        self.messages = []
+        self.messages = queue.Queue()
         self.log_widget = None
         self.ready = False
+        self.context_menu = None
         self._original_stdout = sys.stdout
         self._original_stderr = sys.stderr
 
     def set_log_widget(self, widget):
         self.log_widget = widget
         self.ready = True
-        self.log_widget.configure(font=("Ubuntu Mono", 12), text_color="white")
-        for msg, level in self.messages:
-            self._write_to_widget(msg, level)
-        self.messages.clear()
+
+        self.log_widget.configure(
+            font=("Ubuntu Mono", 12),
+            text_color="white"
+        )
+
+        self.context_menu = tk.Menu(
+            self.log_widget,
+            tearoff=0,
+            bg="#1c1c1c",
+            fg="white",
+            activebackground="#404040",
+            activeforeground="white",
+            font=("Ubuntu Mono", 10)
+        )
+
+        self.context_menu.add_command(
+            label="Copy All",
+            command=self.copy_all
+        )
+
+        self.context_menu.add_command(
+            label="Copy Selected",
+            command=self.copy_selected
+        )
+
+        self.context_menu.add_separator()
+
+        self.context_menu.add_command(
+            label="Clear All",
+            command=self.clear_all
+        )
+
+        self.log_widget._textbox.bind(
+            "<Button-3>",
+            self._show_context_menu
+        )
+
+        self._drain_queue()
+
+    def _show_context_menu(self, event):
+        self.context_menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    def copy_all(self):
+        content = self.log_widget._textbox.get("1.0", "end-1c")
+
+        self.log_widget._textbox.clipboard_clear()
+        self.log_widget._textbox.clipboard_append(content)
+
+    def copy_selected(self):
+        selected = self.log_widget._textbox.tag_ranges("sel")
+
+        if selected:
+            content = self.log_widget._textbox.get(
+                "sel.first",
+                "sel.last"
+            )
+
+            self.log_widget._textbox.clipboard_clear()
+            self.log_widget._textbox.clipboard_append(content)
+
+    def clear_all(self):
+        self.log_widget._textbox.delete("1.0", "end")
 
     def _write_to_widget(self, message, level):
-        log_entry = f"[{datetime.now().strftime('%H:%M:%S')}] {message}\n"
+        log_entry = (
+            f"[{datetime.now().strftime('%H:%M:%S')}] "
+            f"{message}\n"
+        )
+
         self.log_widget.insert("end", log_entry)
         self.log_widget.see("end")
-        self.log_widget.update_idletasks()
+
+    def _drain_queue(self):
+        while not self.messages.empty():
+            message, level = self.messages.get_nowait()
+            self._write_to_widget(message, level)
+
+        self.log_widget.after(50, self._drain_queue)
 
     def log(self, message, level="info"):
-        console_entry = f"[{datetime.now().strftime('%H:%M:%S')}] [{level.upper()}] {message}"
+        console_entry = (
+            f"[{datetime.now().strftime('%H:%M:%S')}] "
+            f"[{level.upper()}] {message}"
+        )
+
         self._original_stdout.write(console_entry + "\n")
         self._original_stdout.flush()
-        if self.ready and self.log_widget:
-            self._write_to_widget(message, level)
-        else:
-            self.messages.append((message, level))
+
+        self.messages.put((message, level))
 
     def enable_console_redirect(self):
         sys.stdout = ConsoleLogger(self, self._original_stdout)
@@ -682,21 +748,30 @@ class StreamingTFTTrainer:
         self.checkpoint_path = None
         self.is_trained = False
         self.stop_flag = False
+        self.model_dir = Config.MODEL_DIR
         self.gpu_manager = GPUManager(verbose=False)
         self.device = self.gpu_manager.get_device("pytorch")
-        self.batch_size = self.gpu_manager.optimize_for_gpu().get("batch_size", Config.DEFAULT_BATCH_SIZE)
+        self.batch_size = self.gpu_manager.optimize_for_gpu().get(
+            "batch_size", Config.DEFAULT_BATCH_SIZE
+        )
 
         tf_params = Config.TIMEFRAME_HYPERPARAMS.get(timeframe, {})
-        self.hidden_size = tf_params.get("hidden_size", Config.DEFAULT_HIDDEN_SIZE)
+        self.hidden_size = tf_params.get(
+            "hidden_size", Config.DEFAULT_HIDDEN_SIZE
+        )
         self.dropout = tf_params.get("dropout", Config.DROPOUT_RATE)
         self.hidden_continuous_size = max(8, self.hidden_size // 2)
         self.quantiles = list(Config.QUANTILES)
+
         self.training_history = {
             "best_val_loss": float("inf"),
             "epochs_completed": 0,
             "directional_accuracy": None,
         }
-        self._log(f"🚀 TFT trainer [{timeframe}] initialized on device: {self.device}")
+
+        self._log(
+            f"🚀 TFT trainer [{timeframe}] initialized on device: {self.device}"
+        )
 
     def _log(self, message):
         if self.log_callback:
@@ -706,33 +781,80 @@ class StreamingTFTTrainer:
         self.stop_flag = True
         self._log("⏹️ Training stop requested")
 
-    def train_streaming(self, data_stream, total_samples, epochs=30, batch_size=512, lookback=60, horizon=10, **kwargs):
+    def train_streaming(
+        self,
+        data_stream,
+        total_samples,
+        epochs=30,
+        batch_size=512,
+        lookback=60,
+        horizon=10,
+        **kwargs
+    ):
         self.stop_flag = False
+
         csv_folder = kwargs.get("csv_folder")
         feature_cols = kwargs.get("feature_cols")
         timeframe = kwargs.get("timeframe", self.timeframe)
         auto_tune = kwargs.get("auto_tune_lookback", True)
         preparer = kwargs.get("data_preparer")
 
-        if auto_tune:
-            lookback = Config.TIMEFRAME_HYPERPARAMS.get(timeframe, {}).get("lookback", lookback)
+        if kwargs.get("model_dir"):
+            self.model_dir = Path(kwargs["model_dir"])
 
-        self._log(f"📊 [{timeframe}] Building PyTorch Forecasting dataframe...")
-        data = preparer.build_dataframe(csv_folder, feature_cols, horizon, timeframe)
+        if auto_tune:
+            lookback = Config.TIMEFRAME_HYPERPARAMS.get(
+                timeframe, {}
+            ).get("lookback", lookback)
+
+        self._log(
+            f"📊 [{timeframe}] Building PyTorch Forecasting dataframe..."
+        )
+
+        data = preparer.build_dataframe(
+            csv_folder,
+            feature_cols,
+            horizon,
+            timeframe
+        )
+
         if len(data) == 0:
             raise ValueError("Empty dataframe")
 
         group_max = data.groupby("group_id")["time_idx"].transform("max")
-        training_data = data[data["time_idx"] <= (group_max - horizon)].copy()
+
+        training_data = data[
+            data["time_idx"] <= (group_max - horizon)
+        ].copy()
+
         if len(training_data) == 0:
             raise ValueError("Empty training data after horizon trim")
 
-        known_reals = [c for c in preparer.feature_cols if c in {"hour_sin", "hour_cos", "day_sin", "day_cos", "month_sin", "month_cos"}]
-        unknown_reals = [c for c in preparer.feature_cols if c not in known_reals]
+        known_reals = [
+            c for c in preparer.feature_cols
+            if c in {
+                "hour_sin",
+                "hour_cos",
+                "day_sin",
+                "day_cos",
+                "month_sin",
+                "month_cos",
+            }
+        ]
+
+        unknown_reals = [
+            c for c in preparer.feature_cols
+            if c not in known_reals
+        ]
+
         if "close" not in unknown_reals and "close" in data.columns:
             unknown_reals.append("close")
 
-        self._log(f"🔧 [{timeframe}] Creating TimeSeriesDataSet (lookback={lookback}, horizon={horizon})...")
+        self._log(
+            f"🔧 [{timeframe}] Creating TimeSeriesDataSet "
+            f"(lookback={lookback}, horizon={horizon})..."
+        )
+
         self.training_dataset = TimeSeriesDataSet(
             training_data,
             time_idx="time_idx",
@@ -750,15 +872,33 @@ class StreamingTFTTrainer:
             add_encoder_length=True,
             allow_missing_timesteps=False,
         )
+
         self.dataset_parameters = self.training_dataset.get_parameters()
+
         self.validation_dataset = TimeSeriesDataSet.from_dataset(
-            self.training_dataset, data, predict=False, stop_randomization=True
+            self.training_dataset,
+            data,
+            predict=False,
+            stop_randomization=True
         )
 
-        train_loader = self.training_dataset.to_dataloader(train=True, batch_size=batch_size, num_workers=Config.NUM_WORKERS)
-        val_loader = self.validation_dataset.to_dataloader(train=False, batch_size=batch_size, num_workers=Config.NUM_WORKERS)
+        train_loader = self.training_dataset.to_dataloader(
+            train=True,
+            batch_size=batch_size,
+            num_workers=Config.NUM_WORKERS
+        )
 
-        self._log(f"📊 [{timeframe}] Train windows: {len(self.training_dataset):,} | Val windows: {len(self.validation_dataset):,}")
+        val_loader = self.validation_dataset.to_dataloader(
+            train=False,
+            batch_size=batch_size,
+            num_workers=Config.NUM_WORKERS
+        )
+
+        self._log(
+            f"📊 [{timeframe}] Train windows: "
+            f"{len(self.training_dataset):,} | "
+            f"Val windows: {len(self.validation_dataset):,}"
+        )
 
         self.model = TemporalFusionTransformer.from_dataset(
             self.training_dataset,
@@ -772,19 +912,38 @@ class StreamingTFTTrainer:
             log_interval=-1,
             reduce_on_plateau_patience=4,
         )
-        self._log(f"🧠 [{timeframe}] Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
 
-        accelerator = "gpu" if self.device.type == "cuda" else ("mps" if self.device.type == "mps" else "cpu")
-        precision = "bf16-mixed" if accelerator == "gpu" and torch.cuda.is_bf16_supported() else "32-true"
+        self._log(
+            f"🧠 [{timeframe}] Model parameters: "
+            f"{sum(p.numel() for p in self.model.parameters()):,}"
+        )
+
+        accelerator = (
+            "gpu" if self.device.type == "cuda"
+            else ("mps" if self.device.type == "mps" else "cpu")
+        )
+
+        precision = (
+            "bf16-mixed"
+            if accelerator == "gpu" and torch.cuda.is_bf16_supported()
+            else "32-true"
+        )
+
+        checkpoint_dir = Path(self.model_dir) / timeframe.lower()
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         checkpoint_callback = ModelCheckpoint(
-            dirpath=str(MODEL_DIR),
-            filename=f"tft-{timeframe.lower()}-best-{{epoch:02d}}-{{val_loss:.5f}}",
+            dirpath=str(checkpoint_dir),
+            filename=(
+                f"tft-{timeframe.lower()}-best-"
+                "{epoch:02d}-{val_loss:.5f}"
+            ),
             monitor="val_loss",
             mode="min",
             save_top_k=1,
             save_last=True,
         )
+
         early_stopping = EarlyStopping(
             monitor="val_loss",
             patience=Config.EARLY_STOPPING_PATIENCE,
@@ -806,37 +965,61 @@ class StreamingTFTTrainer:
             num_sanity_val_steps=0,
         )
 
-        self._log(f"🚀 [{timeframe}] Starting TFT training (accelerator={accelerator}, precision={precision})...")
-        lightning_trainer.fit(self.model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+        self._log(
+            f"🚀 [{timeframe}] Starting TFT training "
+            f"(accelerator={accelerator}, precision={precision})..."
+        )
+
+        lightning_trainer.fit(
+            self.model,
+            train_dataloaders=train_loader,
+            val_dataloaders=val_loader
+        )
 
         if checkpoint_callback.best_model_score is not None:
-            self.training_history["best_val_loss"] = float(checkpoint_callback.best_model_score.detach().cpu().item())
-        self.training_history["epochs_completed"] = lightning_trainer.current_epoch + 1
+            self.training_history["best_val_loss"] = float(
+                checkpoint_callback.best_model_score.detach().cpu().item()
+            )
+
+        self.training_history["epochs_completed"] = (
+            lightning_trainer.current_epoch + 1
+        )
+
         self.is_trained = True
         self.checkpoint_path = checkpoint_callback.best_model_path
 
-        self.training_history["directional_accuracy"] = self._compute_directional_accuracy(val_loader)
+        self.training_history["directional_accuracy"] = (
+            self._compute_directional_accuracy(val_loader)
+        )
+
         if self.training_history["directional_accuracy"] is not None:
-            self._log(f"🎯 [{timeframe}] Directional accuracy: {self.training_history['directional_accuracy'] * 100:.1f}%")
+            self._log(
+                f"🎯 [{timeframe}] Directional accuracy: "
+                f"{self.training_history['directional_accuracy'] * 100:.1f}%"
+            )
 
         self._log(f"🏁 [{timeframe}] TFT training complete")
+
         return True
 
     def _compute_directional_accuracy(self, dataloader):
-        """
-        Compute directional accuracy (median prediction vs. last actual).
-        Iterates the validation dataloader directly to avoid shape inconsistencies
-        from TemporalFusionTransformer.predict() across pytorch_forecasting versions.
-        """
+        was_training = self.model.training
+        model_device = next(self.model.parameters()).device
+
         self.model.eval()
+
         correct = 0
         total = 0
         median_idx = len(self.quantiles) // 2
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for batch in dataloader:
                 x, y = batch
-                x = {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in x.items()}
+
+                x = {
+                    k: v.to(model_device) if torch.is_tensor(v) else v
+                    for k, v in x.items()
+                }
 
                 out = self.model(x)
                 preds = out[0] if isinstance(out, tuple) else out
@@ -849,95 +1032,352 @@ class StreamingTFTTrainer:
                     continue
 
                 target = y[0] if isinstance(y, (tuple, list)) else y
-                target = target.to(self.device)
+                target = target.to(model_device)
 
-                encoder_target = x.get("encoder_target")
-                if encoder_target is None:
-                    continue
+                encoder_target = x["encoder_target"]
+
                 if isinstance(encoder_target, (list, tuple)):
                     encoder_target = encoder_target[0]
-                encoder_target = encoder_target.to(self.device)
+
+                encoder_target = encoder_target.to(model_device)
 
                 last_actual = encoder_target[:, -1].unsqueeze(-1)
 
                 actual_dir = torch.sign(target - last_actual)
                 pred_dir = torch.sign(preds_median - last_actual)
 
-                L = min(actual_dir.size(1), pred_dir.size(1))
-                if L == 0:
+                length = min(
+                    actual_dir.size(1),
+                    pred_dir.size(1)
+                )
+
+                if length == 0:
                     continue
-                actual_dir = actual_dir[:, :L]
-                pred_dir = pred_dir[:, :L]
+
+                actual_dir = actual_dir[:, :length]
+                pred_dir = pred_dir[:, :length]
 
                 valid_mask = actual_dir != 0
-                correct += ((actual_dir == pred_dir) & valid_mask).sum().item()
+
+                correct += (
+                    (actual_dir == pred_dir) & valid_mask
+                ).sum().item()
+
                 total += valid_mask.sum().item()
 
-        self.model.train()
+        self.model.train(was_training)
+
         if total == 0:
             return None
+
         return correct / total
 
-    def save_model(self, filename):
+    def _export_onnx(self, onnx_path, sequence_length, num_features):
+        class _TFTExportShim(torch.nn.Module):
+            def __init__(self, tft, input_keys):
+                super().__init__()
+                self.tft = tft
+                self.input_keys = input_keys
+
+            def forward(self, *inputs):
+                x = dict(zip(self.input_keys, inputs))
+                out = self.tft(x)
+                return out[0] if isinstance(out, tuple) else out
+
+        export_loader = self.validation_dataset.to_dataloader(
+            train=False,
+            batch_size=1,
+            num_workers=0
+        )
+
+        sample_x, sample_y = next(iter(export_loader))
+
+        input_keys = [
+            key for key, value in sample_x.items()
+            if torch.is_tensor(value)
+        ]
+
+        input_tensors = tuple(
+            sample_x[key].detach().cpu()
+            for key in input_keys
+        )
+
+        shim = _TFTExportShim(
+            self.model.to("cpu").eval(),
+            input_keys
+        )
+
+        dynamic_axes = {
+            key: {0: "batch_size"}
+            for key in input_keys
+        }
+
+        dynamic_axes["prediction"] = {
+            0: "batch_size"
+        }
+
+        torch.onnx.export(
+            shim,
+            input_tensors,
+            str(onnx_path),
+            input_names=input_keys,
+            output_names=["prediction"],
+            dynamic_axes=dynamic_axes,
+            opset_version=Config.ONNX_OPSET,
+            dynamo=False,
+        )
+
+        self._log(
+            f"✅ [{self.timeframe}] ONNX exported using actual TFT dataset inputs"
+        )
+
+        return True
+
+    def save_model(
+        self,
+        filename,
+        model_dir=None,
+        sequence_length=None,
+        num_features=None,
+        export_onnx=True
+    ):
         if not self.is_trained or self.model is None:
             self._log("⚠️ No trained model available")
             return False
 
-        output_dir = Path(MODEL_DIR)
+        output_dir = (
+            Path(model_dir)
+            if model_dir
+            else Path(self.model_dir)
+        )
+
         output_dir.mkdir(parents=True, exist_ok=True)
+
         output_path = output_dir / filename
+
         if output_path.suffix != Config.MODEL_EXT:
             output_path = output_path.with_suffix(Config.MODEL_EXT)
 
-        self.model.to("cpu")
-        self.model.save_checkpoint(str(output_path))
+        source_checkpoint = Path(self.checkpoint_path)
+
+        shutil.copy2(
+            source_checkpoint,
+            output_path
+        )
+
+        self._log(
+            f"✅ [{self.timeframe}] Best checkpoint exported: {output_path}"
+        )
 
         metadata_path = output_path.with_suffix(Config.METADATA_EXT)
+        onnx_path = (
+            output_path.with_suffix(Config.ONNX_EXT)
+            if export_onnx
+            else None
+        )
+
         metadata = {
             "model_type": "pytorch_forecasting.TemporalFusionTransformer",
             "timeframe": self.timeframe,
             "checkpoint_path": str(output_path),
+            "onnx_path": str(onnx_path) if onnx_path else None,
+            "onnx_exported": False,
             "dataset_parameters": self.dataset_parameters,
-            "feature_columns": self.training_dataset.reals if self.training_dataset else [],
+            "feature_columns": (
+                self.training_dataset.reals
+                if self.training_dataset
+                else []
+            ),
             "quantiles": self.quantiles,
-            "directional_accuracy": self.training_history.get("directional_accuracy"),
+            "directional_accuracy": self.training_history.get(
+                "directional_accuracy"
+            ),
             "training_history": self.training_history,
             "training_time": datetime.now().isoformat(),
-            "lookback": self.training_dataset.max_encoder_length if self.training_dataset else None,
-            "horizon": self.training_dataset.max_prediction_length if self.training_dataset else None,
+            "lookback": (
+                self.training_dataset.max_encoder_length
+                if self.training_dataset
+                else None
+            ),
+            "horizon": (
+                self.training_dataset.max_prediction_length
+                if self.training_dataset
+                else None
+            ),
         }
+
         with open(metadata_path, "wb") as f:
             pickle.dump(metadata, f)
 
-        self._log(f"✅ [{self.timeframe}] Checkpoint saved: {output_path}")
-        self._log(f"✅ [{self.timeframe}] Metadata saved: {metadata_path}")
+        self._log(
+            f"✅ [{self.timeframe}] Metadata saved: {metadata_path}"
+        )
+
+        if export_onnx and sequence_length and num_features:
+            onnx_ok = self._export_onnx(
+                onnx_path,
+                sequence_length,
+                num_features
+            )
+
+            metadata["onnx_exported"] = onnx_ok
+            metadata["onnx_path"] = str(onnx_path) if onnx_ok else None
+
+            with open(metadata_path, "wb") as f:
+                pickle.dump(metadata, f)
+
+        elif export_onnx:
+            self._log(
+                f"⚠️ [{self.timeframe}] ONNX export skipped: "
+                "sequence_length or num_features missing"
+            )
+
         return True
+
+    def validate_checkpoints(self):
+        checkpoint_dir = Path(self.model_dir).resolve()
+        checkpoint_files = sorted(
+            checkpoint_dir.rglob("*.ckpt")
+        )
+
+        self._log(f"📂 Checkpoint folder: {checkpoint_dir}")
+        self._log(
+            f"📊 Checkpoints found: {len(checkpoint_files)}"
+        )
+
+        results = []
+
+        for path in checkpoint_files:
+            checkpoint = torch.load(
+                path,
+                map_location="cpu",
+                weights_only=False
+            )
+
+            state_dict = checkpoint["state_dict"]
+
+            result = {
+                "filename": str(path.relative_to(checkpoint_dir)),
+                "size": path.stat().st_size,
+                "epoch": checkpoint.get("epoch"),
+                "global_step": checkpoint.get("global_step"),
+                "state_dict_entries": len(state_dict),
+                "optimizer_states": len(
+                    checkpoint.get("optimizer_states", [])
+                ),
+                "timeframe": self.timeframe,
+            }
+
+            results.append(result)
+
+            self._log(
+                f"✅ {result['filename']} | "
+                f"Epoch: {result['epoch']} | "
+                f"Step: {result['global_step']} | "
+                f"Parameters: {result['state_dict_entries']} | "
+                f"Size: {result['size']:,} bytes"
+            )
+
+        return results
+
+    def export_existing_onnx(self, checkpoint_path, onnx_path, validation_dataset):
+        import torch
+        import onnx
+        from pathlib import Path
+
+        checkpoint_path = Path(checkpoint_path)
+        onnx_path = Path(onnx_path)
+
+        self.model = TemporalFusionTransformer.load_from_checkpoint(
+            str(checkpoint_path),
+            map_location="cpu"
+        )
+        self.model.eval()
+
+        validation_loader = validation_dataset.to_dataloader(
+            train=False,
+            batch_size=1,
+            num_workers=0
+        )
+
+        sample_x, _ = next(iter(validation_loader))
+
+        input_keys = tuple(
+            key for key, value in sample_x.items()
+            if isinstance(value, torch.Tensor)
+        )
+        input_names = list(input_keys)
+
+        class TFTExportWrapper(torch.nn.Module):
+            def __init__(self, model, keys):
+                super().__init__()
+                self.model = model
+                self.keys = keys
+
+            def forward(self, *inputs):
+                x = dict(zip(self.keys, inputs))
+                output = self.model(x)
+                return output["prediction"]
+
+        wrapper = TFTExportWrapper(self.model, input_keys)
+        wrapper.eval()
+
+        input_tensors = tuple(sample_x[key].cpu() for key in input_keys)
+
+        dynamic_axes = {
+            name: {0: "batch_size"}
+            for name in input_names
+        }
+        dynamic_axes["prediction"] = {0: "batch_size"}
+
+        torch.onnx.export(
+            wrapper,
+            input_tensors,
+            str(onnx_path),
+            input_names=input_names,
+            output_names=["prediction"],
+            dynamic_axes=dynamic_axes,
+            opset_version=17,
+            dynamo=False
+        )
+
+        onnx.checker.check_model(onnx.load(str(onnx_path)))
+
+        return str(onnx_path)
 
 
 class TFTTrainerGUI(CTk):
     INI_PATH = Path(__file__).with_suffix(".ini")
 
     INDICATOR_CONFIG = [
-        ("ATR", "enable_atr", True),
-        ("Bollinger", "enable_bollinger", True),
-        ("CCI", "enable_cci", True),
-        ("CMF", "enable_cmf", True),
-        ("Donchian", "enable_donchian", True),
-        ("EMA", "enable_ema", True),
-        ("Force Index", "enable_force_index", True),
-        ("MACD", "enable_macd", True),
-        ("MFI", "enable_mfi", True),
-        ("OBV", "enable_obv", True),
-        ("Price Struct", "enable_price_structure", True),
-        ("Realized Vol", "enable_realized_vol", True),
-        ("ROC", "enable_roc", True),
-        ("RSI", "enable_rsi", True),
-        ("RVWAP", "enable_rvwap", True),
-        ("Stochastic", "enable_stochastic", True),
-        ("Volume", "enable_volume_metrics", True),
+        ("ATR", "enable_atr", False),
+        ("Bollinger", "enable_bollinger", False),
+        ("CCI", "enable_cci", False),
+        ("CMF", "enable_cmf", False),
+        ("Donchian", "enable_donchian", False),
+        ("EMA", "enable_ema", False),
+        ("Force Index", "enable_force_index", False),
+        ("MACD", "enable_macd", False),
+        ("MFI", "enable_mfi", False),
+        ("OBV", "enable_obv", False),
+        ("Price Struct", "enable_price_structure", False),
+        ("Realized Vol", "enable_realized_vol", False),
+        ("ROC", "enable_roc", False),
+        ("RSI", "enable_rsi", False),
+        ("RVWAP", "enable_rvwap", False),
+        ("Stochastic", "enable_stochastic", False),
+        ("Volume", "enable_volume_metrics", False),
     ]
 
     def __init__(self):
+        # One-time process setup: ctk theme globals, Lightning seed, directories.
+        # Must run before super().__init__() so the root window inherits them,
+        # and before _load_state() so the dataset/model dirs exist.
+        ctk.set_appearance_mode(Config.THEME)
+        ctk.set_default_color_theme(Config.COLOR_THEME)
+        pl.seed_everything(Config.SEED, workers=True)
+        Config.ensure_directories()
+
         super().__init__()
         self.title(Config.APP_TITLE)
         self.geometry(Config.APP_GEOMETRY)
@@ -973,8 +1413,11 @@ class TFTTrainerGUI(CTk):
         self.deiconify()
 
     def _load_state(self):
+        self.saved_timeframes = None
+
         if not self.INI_PATH.exists():
             return
+
         cp = configparser.ConfigParser()
         cp.read(str(self.INI_PATH))
 
@@ -999,27 +1442,49 @@ class TFTTrainerGUI(CTk):
             self.epochs.set(cp.get("params", "epochs", fallback=str(Config.DEFAULT_EPOCHS)))
             self.batch_size.set(cp.get("params", "batch_size", fallback=str(Config.DEFAULT_BATCH_SIZE)))
             self.auto_tune_var.set(cp.getboolean("params", "auto_tune", fallback=True))
+            self.onnx_var.set(cp.getboolean("params", "onnx_export", fallback=True))
 
         if cp.has_section("features"):
-            self.feature_cols_var.set(cp.get("features", "base_features", fallback="time,open,high,low,close,tick_volume"))
+            self.feature_cols_var.set(
+                cp.get("features", "base_features",
+                    fallback="time,open,high,low,close,tick_volume")
+            )
 
         if cp.has_section("indicators"):
             for var_name in self.indicator_vars:
-                self.indicator_vars[var_name].set(cp.getboolean("indicators", var_name, fallback=True))
+                self.indicator_vars[var_name].set(
+                    cp.getboolean("indicators", var_name, fallback=True)
+                )
+
+        if cp.has_section("timeframes"):
+            self.saved_timeframes = {
+                tf for tf, selected in cp.items("timeframes")
+                if cp.getboolean("timeframes", tf)
+            }
 
     def _save_state(self):
         cp = configparser.ConfigParser()
+
         cp["window"] = {"geometry": self.wm_geometry()}
-        cp["paths"] = {"csv_folder": str(self.csv_path_var.get()), "model_folder": str(self.model_path_var.get())}
+        cp["paths"] = {
+            "csv_folder": str(self.csv_path_var.get()),
+            "model_folder": str(self.model_path_var.get())
+        }
         cp["params"] = {
             "lookback": self.lookback.get(),
             "horizon": self.horizon.get(),
             "epochs": self.epochs.get(),
             "batch_size": self.batch_size.get(),
             "auto_tune": str(self.auto_tune_var.get()),
+            "onnx_export": str(self.onnx_var.get()),
         }
         cp["features"] = {"base_features": self.feature_cols_var.get()}
-        cp["indicators"] = {k: str(v.get()) for k, v in self.indicator_vars.items()}
+        cp["indicators"] = {
+            k: str(v.get()) for k, v in self.indicator_vars.items()
+        }
+        cp["timeframes"] = {
+            tf: str(var.get()) for tf, var in self.timeframe_vars.items()
+        }
 
         with open(self.INI_PATH, "w") as f:
             cp.write(f)
@@ -1030,8 +1495,18 @@ class TFTTrainerGUI(CTk):
         title_frame = CTkFrame(main_frame, corner_radius=6)
         title_frame.pack(fill="x", pady=(0, 4))
 
-        CTkLabel(title_frame, text="Copyright Su Nie | BSD-3C License | https://github.com/can87683", font=("Ubuntu", 16), text_color="yellow").pack(pady=(0, 4))
-        CTkLabel(title_frame, text="🎯 TFT Model Trainer", font=("Ubuntu", 20, "bold")).pack(pady=4)
+        CTkLabel(
+            title_frame,
+            text="Copyright Su Nie | BSD-3C License | https://github.com/can87683",
+            font=("TkDefaultFont", 14),
+            text_color="yellow",
+        ).pack(pady=(0, 2))
+
+        CTkLabel(
+            title_frame,
+            text="TFT Model Trainer",
+            font=("TkDefaultFont", 16, "bold"),
+        ).pack(pady=4)
 
         UsageRow(main_frame)
         self._create_csv_section(main_frame)
@@ -1061,7 +1536,7 @@ class TFTTrainerGUI(CTk):
         CTkButton(folder_frame, text="📁 Model Folder", command=self.select_model_folder, width=120, height=28).pack(side="left", padx=(0, 6))
         self.model_path_var = tk.StringVar(value=str(self.model_folder))
         CTkEntry(folder_frame, textvariable=self.model_path_var, state="readonly", height=28).pack(side="left", fill="x", expand=True)
-        self.status_label = CTkLabel(frame, text="📊 Status: No folder selected", font=("Ubuntu", 10))
+        self.status_label = CTkLabel(frame, text="📊 Status: No folder selected", font=("TkDefaultFont", 10))
         self.status_label.pack(anchor="w", padx=8, pady=1)
 
     def _create_parameters_section(self, parent):
@@ -1093,7 +1568,7 @@ class TFTTrainerGUI(CTk):
             param_frame,
             text="Auto-tune lookback / hidden size per timeframe (recommended)",
             variable=self.auto_tune_var,
-            font=("Ubuntu", 10),
+            font=("TkDefaultFont", 10),
         ).pack(anchor="w", pady=(4, 0))
 
     def _create_features_section(self, parent):
@@ -1102,7 +1577,7 @@ class TFTTrainerGUI(CTk):
         feature_frame = CTkFrame(frame, fg_color="transparent")
         feature_frame.pack(fill="x", padx=8, pady=3)
         self.feature_cols_var = tk.StringVar(value="time,open,high,low,close,tick_volume")
-        CTkLabel(feature_frame, text="Base Features (comma-separated):", font=("Ubuntu", 10)).pack(anchor="w", pady=(0, 2))
+        CTkLabel(feature_frame, text="Base Features (comma-separated):", font=("TkDefaultFont", 10)).pack(anchor="w", pady=(0, 2))
         CTkEntry(feature_frame, textvariable=self.feature_cols_var, height=28).pack(fill="x", pady=(0, 2))
 
     def _create_timeframe_section(self, parent):
@@ -1110,44 +1585,52 @@ class TFTTrainerGUI(CTk):
         frame.pack(fill="x", pady=(0, 4))
         tf_frame = CTkFrame(frame, fg_color="transparent")
         tf_frame.pack(fill="x", padx=8, pady=3)
-        CTkLabel(tf_frame, text="Timeframes (one model each):", font=("Ubuntu", 10)).pack(anchor="w", pady=(0, 2))
+        CTkLabel(tf_frame, text="Timeframes (one model each):", font=("TkDefaultFont", 10)).pack(anchor="w", pady=(0, 2))
         self.timeframe_checklist_frame = CTkFrame(tf_frame, fg_color="transparent")
         self.timeframe_checklist_frame.pack(fill="x")
         self.timeframe_hint_label = CTkLabel(
             self.timeframe_checklist_frame,
             text="Scan a CSV folder to list available timeframes.",
-            font=("Ubuntu", 8),
+            font=("TkDefaultFont", 8),
             text_color="gray",
         )
         self.timeframe_hint_label.pack(anchor="w")
 
-    def _rebuild_timeframe_checklist(self, timeframes):
+    def _rebuild_timeframe_checklist(self, timeframes=None):
         for widget in self.timeframe_checklist_frame.winfo_children():
             widget.destroy()
+
         self.timeframe_vars = {}
-        if not timeframes:
-            self.timeframe_hint_label = CTkLabel(
-                self.timeframe_checklist_frame,
-                text="No timeframes found.",
-                font=("Ubuntu", 8),
-                text_color="gray",
-            )
-            self.timeframe_hint_label.pack(anchor="w")
-            return
+
+        fixed_timeframes = ["M5", "M15", "H1", "H4", "D1", "W1"]
 
         row = CTkFrame(self.timeframe_checklist_frame, fg_color="transparent")
         row.pack(fill="x")
-        for i, tf in enumerate(timeframes):
-            var = tk.BooleanVar(value=True)
+
+        for i, tf in enumerate(fixed_timeframes):
+            default_value = (
+                tf in self.saved_timeframes
+                if self.saved_timeframes is not None
+                else True
+            )
+
+            var = tk.BooleanVar(value=default_value)
             self.timeframe_vars[tf] = var
-            CTkCheckBox(row, text=tf, variable=var, width=70, font=("Ubuntu", 10)).grid(row=0, column=i, padx=3, sticky="w")
+
+            CTkCheckBox(
+                row,
+                text=tf,
+                variable=var,
+                width=70,
+                font=("TkDefaultFont", 10)
+            ).grid(row=0, column=i, padx=3, sticky="w")
 
     def _create_indicators_section(self, parent):
         frame = CTkFrame(parent, corner_radius=6)
         frame.pack(fill="x", pady=(0, 4))
         indicator_frame = CTkFrame(frame, fg_color="transparent")
         indicator_frame.pack(fill="x", padx=8, pady=3)
-        CTkLabel(indicator_frame, text="Technical Indicators (inputs):", font=("Ubuntu", 10)).pack(anchor="w", pady=(0, 2))
+        CTkLabel(indicator_frame, text="Technical Indicators (inputs):", font=("TkDefaultFont", 10)).pack(anchor="w", pady=(0, 2))
         checkboxes_frame = CTkFrame(indicator_frame, fg_color="transparent")
         checkboxes_frame.pack(fill="x")
 
@@ -1158,33 +1641,71 @@ class TFTTrainerGUI(CTk):
             col_idx = i % cols_per_row
             var = tk.BooleanVar(value=default)
             self.indicator_vars[var_name] = var
-            CTkCheckBox(checkboxes_frame, text=label, variable=var, width=95, font=("Ubuntu", 10)).grid(
+            CTkCheckBox(checkboxes_frame, text=label, variable=var, width=95, font=("TkDefaultFont", 10)).grid(
                 row=row_idx, column=col_idx, padx=4, pady=2, sticky="w"
             )
         CTkLabel(
             indicator_frame,
             text="Uncheck indicators you don't want as model inputs",
-            font=("Ubuntu", 8),
+            font=("TkDefaultFont", 8),
             text_color="gray",
         ).pack(anchor="w", pady=(4, 0))
 
     def _create_controls_section(self, parent):
         frame = CTkFrame(parent, corner_radius=6)
         frame.pack(fill="x", pady=(0, 4))
+
         button_frame = CTkFrame(frame, fg_color="transparent")
         button_frame.pack(pady=4)
+
+        self.is_exporting = False
+
+        self.onnx_var = tk.BooleanVar(value=True)
+        self.onnx_checkbox = CTkCheckBox(
+            button_frame,
+            text="Auto-export",
+            variable=self.onnx_var,
+            font=("TkDefaultFont", 11),
+            width=100,
+        )
+        self.onnx_checkbox.pack(side="left", padx=(0, 8))
+
         self.train_btn = CTkButton(
-            button_frame, text="🚀 Start Training", command=self.start_training,
-            width=130, height=34, fg_color="#2e7d32", hover_color="#1b5e20",
-            font=("Ubuntu", 12, "bold"),
+            button_frame,
+            text="🚀 Start Training",
+            command=self.start_training,
+            width=125,
+            height=34,
+            fg_color="#2e7d32",
+            hover_color="#1b5e20",
+            font=("TkDefaultFont", 12, "bold"),
         )
-        self.train_btn.pack(side="left", padx=4)
+        self.train_btn.pack(side="left", padx=2)
+
         self.stop_btn = CTkButton(
-            button_frame, text="⏹️ Stop Training", command=self.stop_training,
-            width=130, height=34, fg_color="#c62828", hover_color="#b71c1c",
-            font=("Ubuntu", 12, "bold"), state="disabled",
+            button_frame,
+            text="⏹️ Stop Training",
+            command=self.stop_training,
+            width=125,
+            height=34,
+            fg_color="#c62828",
+            hover_color="#b71c1c",
+            font=("TkDefaultFont", 12, "bold"),
+            state="disabled",
         )
-        self.stop_btn.pack(side="left", padx=4)
+        self.stop_btn.pack(side="left", padx=2)
+
+        self.onnx_export_btn = CTkButton(
+            button_frame,
+            text="📦 ONNX Export",
+            command=self.export_selected_onnx,
+            width=125,
+            height=34,
+            fg_color="#1565c0",
+            hover_color="#0d47a1",
+            font=("TkDefaultFont", 12, "bold"),
+        )
+        self.onnx_export_btn.pack(side="left", padx=2)
 
     def _create_status_section(self, parent):
         frame = CTkFrame(parent, corner_radius=6)
@@ -1201,19 +1722,152 @@ class TFTTrainerGUI(CTk):
         self.log_text.pack(fill="both", expand=True, padx=8, pady=3)
 
     def update_status(self, message):
+        self.after(0, self._apply_status, message)
+
+    def _apply_status(self, message):
         if self._is_closing:
             return
+
         self.status_text.configure(state="normal")
         self.status_text.delete("1.0", "end")
         self.status_text.insert("1.0", message)
         self.status_text.configure(state="disabled")
-        self.status_text.update_idletasks()
 
     def select_csv_folder(self):
         folder = filedialog.askdirectory(title="Select CSV Data Folder", initialdir=str(self.csv_folder))
         if folder:
             self.csv_path_var.set(folder)
             self.scan_data_source()
+
+    def export_selected_onnx(self):
+        if self.is_training or self.is_exporting:
+            self.gui_logger.log(
+                "⚠️ Training or ONNX export is already running",
+                "warning"
+            )
+            return
+
+        checkpoint_file = filedialog.askopenfilename(
+            title="Select TFT Model Checkpoint",
+            initialdir=str(self.model_folder),
+            filetypes=[
+                ("TFT Checkpoint", "*.ckpt"),
+                ("All Files", "*.*"),
+            ],
+        )
+
+        if not checkpoint_file:
+            return
+
+        checkpoint_path = Path(checkpoint_file)
+        metadata_path = checkpoint_path.with_suffix(Config.METADATA_EXT)
+
+        if not metadata_path.exists():
+            messagebox.showerror(
+                "Missing Model Metadata",
+                f"Matching metadata file not found:\n{metadata_path}"
+            )
+            return
+
+        csv_folder = Path(self.csv_path_var.get())
+
+        if not csv_folder.exists():
+            messagebox.showerror(
+                "CSV Folder Missing",
+                f"CSV folder not found:\n{csv_folder}"
+            )
+            return
+
+        with open(metadata_path, "rb") as f:
+            metadata = pickle.load(f)
+
+        timeframe = metadata["timeframe"]
+        horizon = metadata["horizon"]
+        dataset_parameters = metadata["dataset_parameters"]
+
+        feature_input = self.feature_cols_var.get().strip()
+
+        feature_cols = (
+            [f.strip() for f in feature_input.split(",") if f.strip()]
+            if feature_input
+            else Config.DEFAULT_FEATURES
+        )
+
+        indicator_flags = {
+            key: value.get()
+            for key, value in self.indicator_vars.items()
+        }
+
+        onnx_path = checkpoint_path.with_suffix(Config.ONNX_EXT)
+
+        self.is_exporting = True
+        self.train_btn.configure(state="disabled")
+        self.onnx_export_btn.configure(state="disabled")
+
+        self.gui_logger.log("=" * 60)
+        self.gui_logger.log("📦 Starting standalone TFT ONNX export")
+        self.gui_logger.log(f"📂 Checkpoint: {checkpoint_path}")
+        self.gui_logger.log(f"📊 Timeframe: {timeframe}")
+        self.gui_logger.log(f"📄 Output: {onnx_path}")
+        self.gui_logger.log("=" * 60)
+
+        def export_task():
+            preparer = StreamingDataPreparer(self.gui_logger.log)
+            preparer.set_indicator_flags(**indicator_flags)
+
+            data = preparer.build_dataframe(
+                str(csv_folder),
+                feature_cols,
+                horizon,
+                timeframe,
+            )
+
+            validation_dataset = TimeSeriesDataSet.from_parameters(
+                dataset_parameters,
+                data,
+                predict=False,
+                stop_randomization=True,
+            )
+
+            trainer = StreamingTFTTrainer(
+                self.gui_logger.log,
+                timeframe=timeframe,
+            )
+
+            trainer.export_existing_onnx(
+                checkpoint_path,
+                onnx_path,
+                validation_dataset,
+            )
+
+            metadata["onnx_path"] = str(onnx_path)
+            metadata["onnx_exported"] = True
+            metadata["onnx_export_time"] = datetime.now().isoformat()
+
+            with open(metadata_path, "wb") as f:
+                pickle.dump(metadata, f)
+
+            self.gui_logger.log(
+                f"✅ ONNX export complete: {onnx_path}",
+                "success",
+            )
+
+            self.after(0, self._onnx_export_finished)
+
+        threading.Thread(
+            target=export_task,
+            daemon=True,
+        ).start()
+
+    def _onnx_export_finished(self):
+        if self._is_closing:
+            return
+
+        self.is_exporting = False
+        self.onnx_export_btn.configure(state="normal")
+        self.train_btn.configure(state="normal")
+
+        self.update_status("ONNX export complete")
 
     def select_model_folder(self):
         folder = filedialog.askdirectory(title="Select Model Save Folder", initialdir=str(self.model_folder))
@@ -1288,6 +1942,9 @@ class TFTTrainerGUI(CTk):
             horizon = int(self.horizon.get())
             batch_size = int(self.batch_size.get())
             epochs = int(self.epochs.get())
+            model_folder = self.model_path_var.get()
+            export_onnx = bool(self.onnx_var.get())
+            self.gui_logger.log(f"🧩 ONNX export: {'enabled' if export_onnx else 'disabled'}")
 
             results = {}
 
@@ -1310,11 +1967,20 @@ class TFTTrainerGUI(CTk):
                     data_preparer=self.data_preparer,
                     timeframe=timeframe,
                     auto_tune_lookback=self.auto_tune_var.get(),
+                    model_dir=model_folder,
                 )
 
                 if success and not trainer.stop_flag:
                     filename = f"{Config.MODEL_PREFIX}_{timeframe.lower()}{Config.MODEL_EXT}"
-                    if trainer.save_model(filename):
+                    sequence_length = trainer.training_dataset.max_encoder_length if trainer.training_dataset else lookback
+                    num_features = len(trainer.training_dataset.reals) if trainer.training_dataset else len(feature_cols)
+                    if trainer.save_model(
+                        filename,
+                        model_dir=model_folder,
+                        sequence_length=sequence_length,
+                        num_features=num_features,
+                        export_onnx=export_onnx,
+                    ):
                         self.gui_logger.log(f"✅ [{timeframe}] Model saved: {filename}", "success")
                         results[timeframe] = "trained"
                     else:
@@ -1336,11 +2002,19 @@ class TFTTrainerGUI(CTk):
 
             self.is_training = False
             self.current_trainer = None
+
             if not self._is_closing:
-                self.train_btn.configure(state="normal")
-                self.stop_btn.configure(state="disabled")
+                self.after(0, self._training_finished)
 
         threading.Thread(target=training_task, daemon=True).start()
+
+    def _training_finished(self):
+        if self._is_closing:
+            return
+
+        self.train_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        self.onnx_export_btn.configure(state="normal")
 
     def stop_training(self):
         self.stop_flag = True

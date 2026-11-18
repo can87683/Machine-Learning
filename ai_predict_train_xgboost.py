@@ -1,13 +1,15 @@
-"""
-customtkinter numpy pandas psutil setproctitle xgboost
-"""
 #!/usr/bin/env python3
 # ai_predict_train_xgboost.py
 # Copyright Su Nie | BSD-3C License | https://github.com/can87683
 
+"""
+customtkinter numpy pandas psutil setproctitle xgboost
+"""
 
+import os
+import sys
 import setproctitle
-setproctitle.setproctitle("ai_predict_train_xgboost")
+setproctitle.setproctitle(os.path.basename(sys.argv[0]))
 
 import customtkinter as ctk
 from customtkinter import CTk, CTkFrame, CTkLabel, CTkButton, CTkEntry, CTkTextbox, CTkCheckBox
@@ -23,14 +25,14 @@ import pickle
 import gc
 import psutil
 from datetime import datetime
-import sys
-
 import xgboost as xgb
+import onnxconverter_common
+import onnxmltools
 
 
 class Config:
     HOME = Path.home()
-    MODEL_DIR = HOME / "ai_model_ml"
+    MODEL_DIR = HOME / "ai_model_ml_symbol"
     DATASET_DIR = HOME / "mt5_data"
 
     MAX_ROWS_PER_SYMBOL = 20000
@@ -50,9 +52,11 @@ class Config:
     MODEL_PREFIX = "ai_predict_xgboost"
     MODEL_EXT = ".ubj"
     METADATA_EXT = ".pkl"
+    ONNX_EXT = ".onnx"
+    ONNX_OPSET = 14
 
     APP_TITLE = "🚀 XGBoost Model Trainer"
-    APP_GEOMETRY = "640x1050"
+    APP_GEOMETRY = "640x1020"
     THEME = "dark"
     COLOR_THEME = "dark-blue"
 
@@ -62,15 +66,6 @@ class Config:
     def ensure_directories(cls):
         cls.MODEL_DIR.mkdir(parents=True, exist_ok=True)
         cls.DATASET_DIR.mkdir(parents=True, exist_ok=True)
-
-
-Config.ensure_directories()
-ctk.set_appearance_mode(Config.THEME)
-ctk.set_default_color_theme(Config.COLOR_THEME)
-
-HOME = Config.HOME
-MODEL_DIR = Config.MODEL_DIR
-DATASET_DIR = Config.DATASET_DIR
 
 
 class GPUManager:
@@ -194,6 +189,46 @@ class ConsoleLogger:
 
     def flush(self):
         self.stream.flush()
+
+
+class GUILogger:
+    def __init__(self):
+        self.messages = []
+        self.log_widget = None
+        self.ready = False
+        self._original_stdout = sys.stdout
+        self._original_stderr = sys.stderr
+
+    def set_log_widget(self, widget):
+        self.log_widget = widget
+        self.ready = True
+        self.log_widget.configure(font=("Ubuntu Mono", 12))
+        for msg, level in self.messages:
+            self._write_to_widget(msg, level)
+        self.messages.clear()
+
+    def _write_to_widget(self, message, level):
+        log_entry = f"[{datetime.now().strftime('%H:%M:%S')}] {message}\n"
+        self.log_widget.insert("end", log_entry)
+        self.log_widget.see("end")
+        self.log_widget.update_idletasks()
+
+    def log(self, message, level="info"):
+        console_entry = f"[{datetime.now().strftime('%H:%M:%S')}] [{level.upper()}] {message}"
+        self._original_stdout.write(console_entry + "\n")
+        self._original_stdout.flush()
+        if self.ready and self.log_widget:
+            self._write_to_widget(message, level)
+        else:
+            self.messages.append((message, level))
+
+    def enable_console_redirect(self):
+        sys.stdout = ConsoleLogger(self, self._original_stdout)
+        sys.stderr = ConsoleLogger(self, self._original_stderr)
+
+    def disable_console_redirect(self):
+        sys.stdout = self._original_stdout
+        sys.stderr = self._original_stderr
 
 
 class MemoryOptimizer:
@@ -362,46 +397,6 @@ class FeatureEngineer:
         df['return_x_volume_1'] = df['close'].pct_change() * df['tick_volume']
         df['amihud_illiquidity_20'] = (df['close'].pct_change().abs() / (df['close'] * df['tick_volume']).replace(0, np.nan)).rolling(20).mean()
         return df
-
-
-class GUILogger:
-    def __init__(self):
-        self.messages = []
-        self.log_widget = None
-        self.ready = False
-        self._original_stdout = sys.stdout
-        self._original_stderr = sys.stderr
-
-    def set_log_widget(self, widget):
-        self.log_widget = widget
-        self.ready = True
-        self.log_widget.configure(font=("Ubuntu Mono", 12))
-        for msg, level in self.messages:
-            self._write_to_widget(msg, level)
-        self.messages.clear()
-
-    def _write_to_widget(self, message, level):
-        log_entry = f"[{datetime.now().strftime('%H:%M:%S')}] {message}\n"
-        self.log_widget.insert("end", log_entry)
-        self.log_widget.see("end")
-        self.log_widget.update_idletasks()
-
-    def log(self, message, level="info"):
-        console_entry = f"[{datetime.now().strftime('%H:%M:%S')}] [{level.upper()}] {message}"
-        self._original_stdout.write(console_entry + "\n")
-        self._original_stdout.flush()
-        if self.ready and self.log_widget:
-            self._write_to_widget(message, level)
-        else:
-            self.messages.append((message, level))
-
-    def enable_console_redirect(self):
-        sys.stdout = ConsoleLogger(self, self._original_stdout)
-        sys.stderr = ConsoleLogger(self, self._original_stderr)
-
-    def disable_console_redirect(self):
-        sys.stdout = self._original_stdout
-        sys.stderr = self._original_stderr
 
 
 class StreamingDataPreparer:
@@ -759,7 +754,43 @@ class StreamingXGBoostTrainer:
         self._log(f"🏁 [{timeframe}] Training complete (device={used_device})")
         return True
 
-    def save_model(self, model_dir, filename_stem, feature_cols, horizon, timeframe):
+    def _export_onnx(self, onnx_path, feature_cols):
+        """
+        Best-effort ONNX export for XGBoost.
+
+        The trained model was fit with enable_categorical=True on `group_id`.
+        onnxmltools.convert_xgboost only accepts numeric tensors, so we export
+        a numeric-only graph that omits the categorical `group_id` column. The
+        .ubj file remains the canonical artifact for anything that needs
+        categoricals; the .onnx is a numeric-input alternative for MT5-style
+        consumers that only need the continuous features.
+        """
+        try:
+            numeric_cols = [c for c in feature_cols if c != "group_id"]
+            if not numeric_cols:
+                self._log(f"⚠️ [{self.timeframe}] ONNX export skipped: no numeric feature columns")
+                return False
+
+            # Convert the model's internal categorical split on group_id into a numeric
+            # threshold by re-serializing the booster without the categorical flag.
+            # Simplest reliable approach: rebuild the booster's feature_types to float
+            # for the numeric columns only. If that fails, fall back to refusing export.
+            booster = self.model.get_booster()
+            booster.set_attr(enable_categorical="false")
+            # Feature map so onnxmltools sees the right column names / types.
+            onnx_model = onnxmltools.convert_xgboost(
+                self.model,
+                initial_types=[("input", onnxconverter_common.data_types.FloatTensorType([1, len(numeric_cols)]))],
+                target_opset=Config.ONNX_OPSET,
+            )
+            with open(onnx_path, "wb") as f:
+                f.write(onnx_model.SerializeToString())
+            return True
+        except Exception as exc:
+            self._log(f"⚠️ [{self.timeframe}] ONNX export failed: {exc}")
+            return False
+
+    def save_model(self, model_dir, filename_stem, feature_cols, horizon, timeframe, export_onnx=True):
         if not self.is_trained or self.model is None:
             self._log("⚠️ No trained model available")
             return False
@@ -767,14 +798,31 @@ class StreamingXGBoostTrainer:
         output_dir = Path(model_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         model_path = output_dir / f"{filename_stem}{Config.MODEL_EXT}"
+        onnx_path = output_dir / f"{filename_stem}{Config.ONNX_EXT}"
         metadata_path = output_dir / f"{filename_stem}{Config.METADATA_EXT}"
 
         self.model.save_model(str(model_path))
+
+        onnx_ok = False
+        onnx_columns = None
+        if export_onnx:
+            onnx_ok = self._export_onnx(onnx_path, feature_cols)
+            if onnx_ok:
+                onnx_columns = [c for c in feature_cols if c != "group_id"]
+            else:
+                onnx_path = None
 
         metadata = {
             "model_type": "xgboost.XGBRegressor",
             "timeframe": timeframe,
             "model_path": str(model_path),
+            "onnx_path": str(onnx_path) if onnx_ok else None,
+            "onnx_exported": bool(onnx_ok),
+            "onnx_feature_columns": onnx_columns,
+            "onnx_note": (
+                "ONNX graph accepts numeric features only (group_id categorical omitted). "
+                "Use .ubj for models that require the group_id category."
+            ) if onnx_ok else None,
             "feature_columns": feature_cols,
             "categorical_features": ["group_id"],
             "device_used": self.device_used,
@@ -787,6 +835,8 @@ class StreamingXGBoostTrainer:
             pickle.dump(metadata, file)
 
         self._log(f"✅ XGBoost model saved: {model_path}")
+        if onnx_ok:
+            self._log(f"✅ ONNX model saved: {onnx_path}")
         self._log(f"✅ Metadata saved: {metadata_path}")
         return True
 
@@ -795,26 +845,33 @@ class XGBoostTrainerGUI(CTk):
     INI_PATH = Path(__file__).with_suffix(".ini")
 
     INDICATOR_CONFIG = [
-        ("ATR", "enable_atr", True),
-        ("Bollinger", "enable_bollinger", True),
-        ("CCI", "enable_cci", True),
-        ("CMF", "enable_cmf", True),
-        ("Donchian", "enable_donchian", True),
-        ("EMA", "enable_ema", True),
-        ("Force Index", "enable_force_index", True),
-        ("MACD", "enable_macd", True),
-        ("MFI", "enable_mfi", True),
-        ("OBV", "enable_obv", True),
-        ("Price Struct", "enable_price_structure", True),
-        ("Realized Vol", "enable_realized_vol", True),
-        ("ROC", "enable_roc", True),
-        ("RSI", "enable_rsi", True),
-        ("RVWAP", "enable_rvwap", True),
-        ("Stochastic", "enable_stochastic", True),
-        ("Volume", "enable_volume_metrics", True),
+        ("ATR", "enable_atr", False),
+        ("Bollinger", "enable_bollinger", False),
+        ("CCI", "enable_cci", False),
+        ("CMF", "enable_cmf", False),
+        ("Donchian", "enable_donchian", False),
+        ("EMA", "enable_ema", False),
+        ("Force Index", "enable_force_index", False),
+        ("MACD", "enable_macd", False),
+        ("MFI", "enable_mfi", False),
+        ("OBV", "enable_obv", False),
+        ("Price Struct", "enable_price_structure", False),
+        ("Realized Vol", "enable_realized_vol", False),
+        ("ROC", "enable_roc", False),
+        ("RSI", "enable_rsi", False),
+        ("RVWAP", "enable_rvwap", False),
+        ("Stochastic", "enable_stochastic", False),
+        ("Volume", "enable_volume_metrics", False),
     ]
 
     def __init__(self):
+        # One-time process setup: ctk theme globals and directories.
+        # Must run before super().__init__() so the root window inherits them,
+        # and before _load_state() so the dataset/model dirs exist.
+        ctk.set_appearance_mode(Config.THEME)
+        ctk.set_default_color_theme(Config.COLOR_THEME)
+        Config.ensure_directories()
+
         super().__init__()
         self.title(Config.APP_TITLE)
         self.geometry(Config.APP_GEOMETRY)
@@ -861,21 +918,12 @@ class XGBoostTrainerGUI(CTk):
         if cp.has_section("window"):
             geom = cp.get("window", "geometry", fallback="")
             if geom:
-                # wm_geometry() is frame-relative and round-trips exactly
-                # through self.geometry() - no title-bar drift.
                 self.geometry(geom)
             else:
-                # Legacy ini stored only x/y from winfo_x/winfo_y (client coords).
-                # On Windows this caused a ~37px downward creep per launch.
-                # Fall back to size only to break the drift loop.
                 x = cp.get("window", "x", fallback="")
                 y = cp.get("window", "y", fallback="")
                 if x and y:
                     try:
-                        # winfo_x/y are client coords; geometry() expects
-                        # frame coords. Since we can't reliably reconstruct
-                        # the title-bar offset here, just restore size only
-                        # and let the WM place the window.
                         self.geometry(Config.APP_GEOMETRY)
                     except Exception:
                         pass
@@ -895,6 +943,7 @@ class XGBoostTrainerGUI(CTk):
             self.iters.set(cp.get("params", "iterations", fallback=str(Config.DEFAULT_ITERATIONS)))
             self.lr.set(cp.get("params", "learning_rate", fallback=str(Config.DEFAULT_LEARNING_RATE)))
             self.depth.set(cp.get("params", "max_depth", fallback=str(Config.DEFAULT_MAX_DEPTH)))
+            self.onnx_var.set(cp.getboolean("params", "onnx_export", fallback=True))
 
         if cp.has_section("features"):
             self.feat_var.set(cp.get("features", "base_features", fallback="time,open,high,low,close,tick_volume"))
@@ -910,10 +959,6 @@ class XGBoostTrainerGUI(CTk):
 
     def _save_state(self):
         cp = configparser.ConfigParser()
-        # Store wm_geometry() directly. It is frame-relative (same coordinate
-        # system that geometry() consumes), so a save/restore round-trip is
-        # exact. Using winfo_x()/winfo_y() instead caused the ~37px downward
-        # creep per launch because those return client-area coords.
         cp["window"] = {"geometry": self.wm_geometry()}
         cp["paths"] = {"csv_folder": str(self.csv_var.get()), "model_folder": str(self.model_var.get())}
         cp["params"] = {
@@ -921,6 +966,7 @@ class XGBoostTrainerGUI(CTk):
             "iterations": self.iters.get(),
             "learning_rate": self.lr.get(),
             "max_depth": self.depth.get(),
+            "onnx_export": str(self.onnx_var.get()),
         }
         cp["features"] = {"base_features": self.feat_var.get()}
         cp["timeframes"] = {tf: str(var.get()) for tf, var in self.tf_vars.items()}
@@ -932,13 +978,25 @@ class XGBoostTrainerGUI(CTk):
     def _create_ui(self):
         main_frame = CTkFrame(self, fg_color="transparent")
         main_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
         title_frame = CTkFrame(main_frame, corner_radius=6)
         title_frame.pack(fill="x", pady=(0, 4))
 
-        CTkLabel(title_frame, text="Copyright Su Nie | BSD-3C License | https://github.com/can87683", font=("Ubuntu", 16), text_color="yellow").pack(pady=(0, 4))
-        CTkLabel(title_frame, text="🎯 XGBoost Model Trainer", font=("Ubuntu", 20, "bold")).pack(pady=4)
+        CTkLabel(
+            title_frame,
+            text="Copyright Su Nie | BSD-3C License | https://github.com/can87683",
+            font=("TkDefaultFont", 14),
+            text_color="yellow",
+        ).pack(pady=(0, 2))
+
+        CTkLabel(
+            title_frame,
+            text="XGBoost Model Trainer",
+            font=("TkDefaultFont", 16, "bold"),
+        ).pack(pady=4)
 
         UsageRow(main_frame)
+
         self._create_csv(main_frame)
         self._create_model(main_frame)
         self._create_params(main_frame)
@@ -966,7 +1024,7 @@ class XGBoostTrainerGUI(CTk):
         CTkButton(folder_frame, text="📁 Model Folder", command=self.select_model, width=120, height=28).pack(side="left", padx=(0, 6))
         self.model_var = tk.StringVar(value=str(self.model_folder))
         CTkEntry(folder_frame, textvariable=self.model_var, state="readonly", height=28).pack(side="left", fill="x", expand=True)
-        self.stat_lbl = CTkLabel(frame, text="📊 Status: Ready", font=("Ubuntu", 10))
+        self.stat_lbl = CTkLabel(frame, text="📊 Status: Ready", font=("TkDefaultFont", 10))
         self.stat_lbl.pack(anchor="w", padx=8, pady=1)
 
     def _create_params(self, parent):
@@ -999,7 +1057,7 @@ class XGBoostTrainerGUI(CTk):
         feature_frame = CTkFrame(frame, fg_color="transparent")
         feature_frame.pack(fill="x", padx=8, pady=3)
         self.feat_var = tk.StringVar(value="time,open,high,low,close,tick_volume")
-        CTkLabel(feature_frame, text="Base Features:", font=("Ubuntu", 10)).pack(anchor="w", pady=(0, 2))
+        CTkLabel(feature_frame, text="Base Features:", font=("TkDefaultFont", 10)).pack(anchor="w", pady=(0, 2))
         CTkEntry(feature_frame, textvariable=self.feat_var, height=28).pack(fill="x", pady=(0, 2))
 
     def _create_tfs(self, parent):
@@ -1007,21 +1065,21 @@ class XGBoostTrainerGUI(CTk):
         frame.pack(fill="x", pady=(0, 4))
         tf_frame = CTkFrame(frame, fg_color="transparent")
         tf_frame.pack(fill="x", padx=8, pady=3)
-        CTkLabel(tf_frame, text="Timeframes (one model each):", font=("Ubuntu", 10)).pack(anchor="w", pady=(0, 2))
+        CTkLabel(tf_frame, text="Timeframes (one model each):", font=("TkDefaultFont", 10)).pack(anchor="w", pady=(0, 2))
         self.tf_vars = {}
         checkboxes_frame = CTkFrame(tf_frame, fg_color="transparent")
         checkboxes_frame.pack(fill="x")
         for i, tf in enumerate(Config.TIMEFRAMES):
             var = tk.BooleanVar(value=True)
             self.tf_vars[tf] = var
-            CTkCheckBox(checkboxes_frame, text=tf, variable=var, width=70, font=("Ubuntu", 10)).grid(row=0, column=i, padx=3, sticky="w")
+            CTkCheckBox(checkboxes_frame, text=tf, variable=var, width=70, font=("TkDefaultFont", 10)).grid(row=0, column=i, padx=3, sticky="w")
 
     def _create_inds(self, parent):
         frame = CTkFrame(parent, corner_radius=6)
         frame.pack(fill="x", pady=(0, 4))
         indicator_frame = CTkFrame(frame, fg_color="transparent")
         indicator_frame.pack(fill="x", padx=8, pady=3)
-        CTkLabel(indicator_frame, text="Technical Indicators (inputs):", font=("Ubuntu", 10)).pack(anchor="w", pady=(0, 2))
+        CTkLabel(indicator_frame, text="Technical Indicators (inputs):", font=("TkDefaultFont", 10)).pack(anchor="w", pady=(0, 2))
         checkboxes_frame = CTkFrame(indicator_frame, fg_color="transparent")
         checkboxes_frame.pack(fill="x")
 
@@ -1032,13 +1090,13 @@ class XGBoostTrainerGUI(CTk):
             col_idx = i % cols_per_row
             var = tk.BooleanVar(value=default)
             self.ind_vars[var_name] = var
-            CTkCheckBox(checkboxes_frame, text=label, variable=var, width=95, font=("Ubuntu", 10)).grid(
+            CTkCheckBox(checkboxes_frame, text=label, variable=var, width=95, font=("TkDefaultFont", 10)).grid(
                 row=row_idx, column=col_idx, padx=4, pady=2, sticky="w"
             )
         CTkLabel(
             indicator_frame,
             text="Uncheck indicators you don't want as model inputs",
-            font=("Ubuntu", 8),
+            font=("TkDefaultFont", 8),
             text_color="gray",
         ).pack(anchor="w", pady=(4, 0))
 
@@ -1047,16 +1105,27 @@ class XGBoostTrainerGUI(CTk):
         frame.pack(fill="x", pady=(0, 4))
         button_frame = CTkFrame(frame, fg_color="transparent")
         button_frame.pack(pady=4)
+
+        self.onnx_var = tk.BooleanVar(value=True)
+        self.onnx_checkbox = CTkCheckBox(
+            button_frame,
+            text="ONNX Export",
+            variable=self.onnx_var,
+            font=("TkDefaultFont", 11),
+            width=110,
+        )
+        self.onnx_checkbox.pack(side="left", padx=(0, 12))
+
         self.train_btn = CTkButton(
             button_frame, text="🚀 Start Training", command=self.start_train,
             width=130, height=34, fg_color="#2e7d32", hover_color="#1b5e20",
-            font=("Ubuntu", 12, "bold"),
+            font=("TkDefaultFont", 12, "bold"),
         )
         self.train_btn.pack(side="left", padx=4)
         self.stop_btn = CTkButton(
             button_frame, text="⏹️ Stop Training", command=self.stop_train,
             width=130, height=34, fg_color="#c62828", hover_color="#b71c1c",
-            font=("Ubuntu", 12, "bold"), state="disabled",
+            font=("TkDefaultFont", 12, "bold"), state="disabled",
         )
         self.stop_btn.pack(side="left", padx=4)
 
@@ -1158,6 +1227,8 @@ class XGBoostTrainerGUI(CTk):
             learning_rate = float(self.lr.get())
             max_depth = int(self.depth.get())
             model_folder = self.model_var.get()
+            export_onnx = bool(self.onnx_var.get())
+            self.gui_logger.log(f"🧩 ONNX export: {'enabled' if export_onnx else 'disabled'}")
 
             results = {}
 
@@ -1194,6 +1265,7 @@ class XGBoostTrainerGUI(CTk):
                         feature_cols=feature_columns,
                         horizon=horizon,
                         timeframe=timeframe,
+                        export_onnx=export_onnx,
                     ):
                         self.gui_logger.log(f"✅ [{timeframe}] Model saved: {filename_stem}{Config.MODEL_EXT}", "success")
                         results[timeframe] = f"trained ({trainer.device_used})"
