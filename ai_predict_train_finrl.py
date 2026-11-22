@@ -1,13 +1,14 @@
-"""
-customtkinter gymnasium numpy pandas psutil setproctitle stable-baselines3
-"""
 #!/usr/bin/env python3
 # ai_predict_train_finrl.py
 # Copyright Su Nie | BSD-3C License | https://github.com/can87683
+"""
+customtkinter gymnasium numpy pandas psutil setproctitle stable-baselines3
+"""
 
-
+import os
+import sys
 import setproctitle
-setproctitle.setproctitle("ai_predict_train_finrl")
+setproctitle.setproctitle(os.path.basename(sys.argv[0]))
 
 import customtkinter as ctk
 import tkinter as tk
@@ -18,17 +19,17 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import psutil
-import sys
 from datetime import datetime
-
 import gymnasium as gym
 from gymnasium import spaces
 from stable_baselines3 import PPO, SAC
+import onnxconverter_common
+import onnxmltools
 
 
 class Config:
     HOME = Path.home()
-    MODEL_DIR = HOME / "ai_model_ml"
+    MODEL_DIR = HOME / "ai_model_ml_symbol"
     DATASET_DIR = HOME / "mt5_data"
 
     MAX_ROWS_PER_SYMBOL = 20000
@@ -43,48 +44,25 @@ class Config:
 
     MODEL_PREFIX = "ai_predict_finrl"
     MODEL_EXT = ".zip"
-    METADATA_EXT = ".pkl"
+    METADATA_EXT = ".json"
+    ONNX_EXT = ".onnx"
+    ONNX_OPSET = 14
 
-    APP_TITLE = "🚀 FinRL Model Trainer"
-    APP_GEOMETRY = "640x1050"
+    APP_TITLE = "FinRL Model Trainer"
+    APP_GEOMETRY = "640x1020"
     THEME = "dark"
     COLOR_THEME = "dark-blue"
 
     SEED = 42
 
-    @classmethod
-    def ensure_directories(cls):
-        cls.MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        cls.DATASET_DIR.mkdir(parents=True, exist_ok=True)
-
-
-Config.ensure_directories()
-ctk.set_appearance_mode(Config.THEME)
-ctk.set_default_color_theme(Config.COLOR_THEME)
-
-HOME = Config.HOME
-MODEL_DIR = Config.MODEL_DIR
-DATASET_DIR = Config.DATASET_DIR
-
-np.random.seed(Config.SEED)
-
 
 class GPUManager:
-    def __init__(self, verbose=True, log_callback=None):
-        self.verbose = verbose
+    def __init__(self, log_callback):
         self.log_callback = log_callback
         self.gpu_available = False
         self.gpu_name = None
         self.gpu_memory_gb = 0.0
-        self._detect_gpu()
 
-    def _log(self, message):
-        if self.log_callback:
-            self.log_callback(message)
-        elif self.verbose:
-            print(f"[GPUManager] {message}")
-
-    def _detect_gpu(self):
         import subprocess
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
@@ -100,56 +78,77 @@ class GPUManager:
                 capture_output=True, text=True, timeout=3
             )
             self.gpu_memory_gb = float(mem_result.stdout.strip().split()[0]) / 1024.0
-            self._log(f"✅ GPU detected: {self.gpu_name} ({self.gpu_memory_gb:.2f} GB)")
+            self.log_callback(f"GPU detected: {self.gpu_name} ({self.gpu_memory_gb:.2f} GB)")
         else:
-            self._log("ℹ️ No GPU detected, using CPU")
+            self.log_callback("No GPU detected, using CPU")
 
     def log_system_info(self):
-        self._log("=" * 60)
-        self._log("🖥️ System & Library Information")
-        self._log("=" * 60)
-        self._log(f"🐍 Python: {sys.version.split()[0]}")
-        try:
-            import stable_baselines3
-            self._log(f"🤖 stable-baselines3: {stable_baselines3.__version__}")
-        except ImportError:
-            self._log("🤖 stable-baselines3: Not installed")
-        try:
-            import gymnasium
-            self._log(f"🎮 gymnasium: {gymnasium.__version__}")
-        except ImportError:
-            self._log("🎮 gymnasium: Not installed")
+        self.log_callback("=" * 60)
+        self.log_callback("System & Library Information")
+        self.log_callback("=" * 60)
+        self.log_callback(f"Python: {sys.version.split()[0]}")
+        import stable_baselines3
+        self.log_callback(f"stable-baselines3: {stable_baselines3.__version__}")
+        import gymnasium
+        self.log_callback(f"gymnasium: {gymnasium.__version__}")
         if self.gpu_available:
-            self._log(f"🎮 GPU Device: {self.gpu_name}")
-            self._log(f"💾 GPU Memory: {self.gpu_memory_gb:.2f} GB")
+            self.log_callback(f"GPU Device: {self.gpu_name}")
+            self.log_callback(f"GPU Memory: {self.gpu_memory_gb:.2f} GB")
         else:
-            self._log("⚠️ No GPU detected. Will use CPU.")
-        self._log("=" * 60)
+            self.log_callback("No GPU detected. Will use CPU.")
+        self.log_callback("=" * 60)
 
 
 class UsageRow:
+    FRAME_HEIGHT = 40
+    FRAME_CORNER_RADIUS = 2
+    FRAME_BG = "#1c1c1c"
+    FRAME_PADY = 2
+
+    FONT = ("TkDefaultFont", 20)
+    TEXT_COLOR = "Lime"
+    PLACEHOLDER_TEXT = "Loading system usage..."
+
+    LABEL_PADX = 2
+    LABEL_PADY = 2
+
+    REFRESH_MS = 2000
+
     def __init__(self, parent):
-        self.usage_frame = ctk.CTkFrame(parent, height=40, corner_radius=5)
-        self.usage_frame.pack(fill="x", pady=(0, 10))
-        self.usage_label = ctk.CTkLabel(self.usage_frame, text="Loading system usage...", font=("Ubuntu Mono", 20), text_color="Lime")
-        self.usage_label.pack(expand=True, fill="x", padx=10, pady=5)
+        self.usage_frame = ctk.CTkFrame(
+            parent,
+            height=self.FRAME_HEIGHT,
+            corner_radius=self.FRAME_CORNER_RADIUS,
+            fg_color=self.FRAME_BG,
+        )
+        self.usage_frame.pack(fill="x", pady=self.FRAME_PADY)
+        self.usage_frame.pack_propagate(False)
+
+        self.usage_label = ctk.CTkLabel(
+            self.usage_frame,
+            text=self.PLACEHOLDER_TEXT,
+            font=self.FONT,
+            text_color=self.TEXT_COLOR,
+        )
+        self.usage_label.pack(
+            expand=True, fill="x",
+            padx=self.LABEL_PADX, pady=self.LABEL_PADY,
+        )
         self._update_usage()
 
     def _update_usage(self):
-        cpu = psutil.cpu_percent(interval=0.5)
+        cpu = psutil.cpu_percent(interval=None)
         dram = psutil.virtual_memory().percent
-        gpu_percent = 0.0
-        vram_percent = 0.0
-        try:
-            import GPUtil
-            gpus = GPUtil.getGPUs()
-            if gpus:
-                gpu_percent = gpus[0].load * 100
-                vram_percent = gpus[0].memoryUtil * 100
-        except ImportError:
-            pass
-        self.usage_label.configure(text=f"CPU: {cpu:.1f}%  DRAM: {dram:.1f}%  GPU: {gpu_percent:.1f}%  VRAM: {vram_percent:.1f}%")
-        self.usage_label.after(2000, self._update_usage)
+        gpu_percent = vram_percent = 0
+        gpus = GPUtil.getGPUs()
+        if gpus:
+            gpu_percent = gpus[0].load * 100
+            vram_percent = gpus[0].memoryUtil * 100
+        self.usage_label.configure(
+            text=f"CPU: {cpu:.1f}%  DRAM: {dram:.1f}%  "
+                 f"GPU: {gpu_percent:.1f}%  VRAM: {vram_percent:.1f}%"
+        )
+        self.usage_label.after(self.REFRESH_MS, self._update_usage)
 
 
 class ConsoleLogger:
@@ -161,8 +160,7 @@ class ConsoleLogger:
         if message and message.strip():
             self.original_stream.write(message)
             self.original_stream.flush()
-            if self.gui_logger:
-                self.gui_logger.log(message.strip(), "console")
+            self.gui_logger.log(message.strip(), "console")
 
     def flush(self):
         self.original_stream.flush()
@@ -265,52 +263,27 @@ class TradingEnv(gym.Env):
 
 
 class FinRLDataPreparer:
-    def __init__(self, log_callback=None):
-        self.log_callback = log_callback or print
-
-    def _log(self, message):
-        if self.log_callback:
-            self.log_callback(message)
+    def __init__(self, log_callback):
+        self.log_callback = log_callback
 
     def scan_folder(self, folder):
         folder = Path(folder)
-        if not folder.exists():
-            return [], []
         symbols = []
         all_timeframes = set()
         for d in sorted(folder.iterdir()):
-            if not d.is_dir():
-                continue
             symbol = d.name
-            found = []
-            for timeframe in Config.TIMEFRAMES:
-                if (d / f"{symbol}_{timeframe}.csv").exists():
-                    found.append(timeframe)
-                    all_timeframes.add(timeframe)
+            found = [tf for tf in Config.TIMEFRAMES if (d / f"{symbol}_{tf}.csv").exists()]
             if found:
                 symbols.append((symbol, found))
-                self._log(f"   ✓ {symbol}: {', '.join(found)}")
+                all_timeframes.update(found)
+                self.log_callback(f"   {symbol}: {', '.join(found)}")
         return symbols, sorted(all_timeframes)
 
     def load_and_prepare(self, symbol, timeframe, folder):
         csv_file = Path(folder) / symbol / f"{symbol}_{timeframe}.csv"
-        if not csv_file.exists():
-            return None
-
         df = pd.read_csv(csv_file)
-        if "time" not in df.columns or "close" not in df.columns:
-            self._log(f"⚠️ Missing time or close column: {csv_file}")
-            return None
 
-        if "tick_volume" not in df.columns:
-            self._log(f"⚠️ {csv_file}: no tick_volume column found. Columns: {list(df.columns)}")
-            return None
-
-        if pd.api.types.is_numeric_dtype(df["time"]):
-            df["time"] = pd.to_datetime(df["time"], unit="s")
-        else:
-            df["time"] = pd.to_datetime(df["time"])
-
+        df["time"] = pd.to_datetime(df["time"], unit="s") if pd.api.types.is_numeric_dtype(df["time"]) else pd.to_datetime(df["time"])
         df = df.sort_values("time").drop_duplicates("time").reset_index(drop=True)
         df = df.iloc[-Config.MAX_ROWS_PER_SYMBOL:].copy()
 
@@ -337,39 +310,35 @@ class FinRLDataPreparer:
         df['atr'] = true_range.rolling(14).mean()
 
         df = df.fillna(0.0)
-        self._log(f"   📊 {symbol}_{timeframe}: {len(df)} steps prepared")
+        self.log_callback(f"   {symbol}_{timeframe}: {len(df)} steps prepared")
         return df
 
 
 class StreamingFinRLTrainer:
-    def __init__(self, log_callback=None, timeframe=None):
-        self.log_callback = log_callback or print
+    def __init__(self, log_callback, timeframe):
+        self.log_callback = log_callback
         self.timeframe = timeframe
         self.model = None
         self.is_trained = False
         self.stop_flag = False
         self.training_history = {}
-        self._log(f"🚀 FinRL [{timeframe}] initialized")
-
-    def _log(self, message):
-        if self.log_callback:
-            self.log_callback(message)
+        self.log_callback(f"FinRL [{timeframe}] initialized")
 
     def stop_training(self):
         self.stop_flag = True
-        self._log("⏹️ Training stop requested")
+        self.log_callback("Training stop requested")
 
-    def train_single_timeframe(self, df, timeframe, algo="PPO", timesteps=50000, lr=0.0003):
+    def train_single_timeframe(self, df, timeframe, algo, timesteps, lr):
         self.stop_flag = False
         self.timeframe = timeframe
 
         env = TradingEnv(df)
-        self._log(f"📊 [{timeframe}] Training {algo} for {timesteps} timesteps...")
+        self.log_callback(f"[{timeframe}] Training {algo} for {timesteps} timesteps...")
 
         if algo == "PPO":
-            self.model = PPO("MlpPolicy", env, learning_rate=lr, verbose=0, seed=Config.SEED)
+            self.model = PPO("MlpPolicy", env, learning_rate=lr, verbose=0, seed=Config.SEED, device="cpu")
         elif algo == "SAC":
-            self.model = SAC("MlpPolicy", env, learning_rate=lr, verbose=0, seed=Config.SEED)
+            self.model = SAC("MlpPolicy", env, learning_rate=lr, verbose=0, seed=Config.SEED, device="cpu")
         else:
             raise ValueError(f"Unsupported algorithm: {algo}")
 
@@ -382,41 +351,73 @@ class StreamingFinRLTrainer:
             "timesteps": timesteps,
             "learning_rate": lr,
         }
-        return self.is_trained
 
-    def save_model(self, model_dir, stem, timeframe):
-        if not self.is_trained or self.model is None:
-            self._log("⚠️ No trained model available")
-            return False
-
+    def save_model(self, model_dir, stem, timeframe, export_onnx):
         output_dir = Path(model_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         model_path = output_dir / f"{stem}_{timeframe}{Config.MODEL_EXT}"
+        onnx_path = output_dir / f"{stem}_{timeframe}{Config.ONNX_EXT}"
+        metadata_path = output_dir / f"{stem}_{timeframe}{Config.METADATA_EXT}"
 
         self.model.save(str(model_path))
-        self._log(f"✅ FinRL model saved: {model_path}")
-        return True
+
+        if export_onnx:
+            import torch
+            policy = self.model.policy
+            obs_shape = policy.observation_space.shape
+            dummy_obs = torch.zeros(1, *obs_shape, dtype=torch.float32)
+            torch.onnx.export(
+                policy,
+                dummy_obs,
+                str(onnx_path),
+                input_names=["observation"],
+                output_names=["action"],
+                opset_version=Config.ONNX_OPSET,
+                dynamo=False,
+            )
+
+        import pickle
+        metadata = {
+            "model_type": "stable_baselines3.PPO" if self.training_history["algorithm"] == "PPO" else "stable_baselines3.SAC",
+            "timeframe": timeframe,
+            "model_path": str(model_path),
+            "onnx_path": str(onnx_path) if export_onnx else None,
+            "onnx_exported": bool(export_onnx),
+            "algorithm": self.training_history["algorithm"],
+            "observation_shape": list(self.model.policy.observation_space.shape),
+            "action_shape": list(self.model.policy.action_space.shape),
+            "training_history": self.training_history,
+            "training_time": datetime.now().isoformat(),
+        }
+        with open(metadata_path, "wb") as file:
+            pickle.dump(metadata, file)
+
+        self.log_callback(f"FinRL model saved: {model_path}")
+        if export_onnx:
+            self.log_callback(f"ONNX model saved: {onnx_path}")
+        self.log_callback(f"Metadata saved: {metadata_path}")
 
 
 class FinRLTrainerGUI(ctk.CTk):
     INI_PATH = Path(__file__).with_suffix(".ini")
 
     def __init__(self):
+        ctk.set_appearance_mode(Config.THEME)
+        ctk.set_default_color_theme(Config.COLOR_THEME)
+        Config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        Config.DATASET_DIR.mkdir(parents=True, exist_ok=True)
+
         super().__init__()
         self.title(Config.APP_TITLE)
         self.geometry(Config.APP_GEOMETRY)
         self.resizable(False, False)
         self._is_closing = False
-
-        # Hide the window while we build the UI and restore saved geometry,
-        # so the user never sees the default position/size flash before the
-        # saved position is applied.
         self.withdraw()
 
         self.gui_logger = GUILogger()
         self.gui_logger.enable_console_redirect()
 
-        self.gpu_manager = GPUManager(verbose=False, log_callback=self.gui_logger.log)
+        self.gpu_manager = GPUManager(log_callback=self.gui_logger.log)
 
         self.csv_folder = Config.DATASET_DIR
         self.model_folder = Config.MODEL_DIR
@@ -426,7 +427,7 @@ class FinRLTrainerGUI(ctk.CTk):
         self.data_preparer = FinRLDataPreparer(self.gui_logger.log)
 
         self._create_ui()
-        self._load_state()  # applied while the window is hidden
+        self._load_state()
         self.gui_logger.set_log_widget(self.log_text)
 
         self.gpu_manager.log_system_info()
@@ -434,7 +435,6 @@ class FinRLTrainerGUI(ctk.CTk):
         self.after(500, self.scan_data)
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
 
-        # Flush pending geometry/layout work, then reveal the window.
         self.update_idletasks()
         self.deiconify()
 
@@ -445,65 +445,33 @@ class FinRLTrainerGUI(ctk.CTk):
         cp.read(str(self.INI_PATH))
 
         if cp.has_section("window"):
-            x = cp.get("window", "x", fallback="")
-            y = cp.get("window", "y", fallback="")
-            if x and y:
-                # winfo_x()/winfo_y() return the *client area* origin, but
-                # Tk's geometry +x+y offset refers to the *window frame* origin
-                # (including title bar / borders). On most WMs this makes the
-                # restored position drift down by the height of the title bar
-                # each launch (~37px on Windows). Store & restore using
-                # wm_geometry-style coordinates so the offset is symmetric.
-                self.geometry(f"{Config.APP_GEOMETRY}+{x}+{y}")
+            self.geometry(cp["window"]["geometry"])
 
         if cp.has_section("paths"):
-            csv = cp.get("paths", "csv_folder", fallback="")
-            model = cp.get("paths", "model_folder", fallback="")
-            if csv:
-                self.csv_var.set(csv)
-                self.csv_folder = Path(csv)
-            if model:
-                self.model_var.set(model)
-                self.model_folder = Path(model)
+            self.csv_var.set(cp["paths"]["csv_folder"])
+            self.csv_folder = Path(cp["paths"]["csv_folder"])
+            self.model_var.set(cp["paths"]["model_folder"])
+            self.model_folder = Path(cp["paths"]["model_folder"])
 
         if cp.has_section("params"):
-            self.algo.set(cp.get("params", "algorithm", fallback=Config.DEFAULT_ALGO))
-            self.timesteps.set(cp.get("params", "timesteps", fallback=str(Config.DEFAULT_TIMESTEPS)))
-            self.lr.set(cp.get("params", "learning_rate", fallback=str(Config.DEFAULT_LR)))
+            self.algo.set(cp["params"]["algorithm"])
+            self.timesteps.set(cp["params"]["timesteps"])
+            self.lr.set(cp["params"]["learning_rate"])
+            self.onnx_var.set(cp["params"].getboolean("onnx_export"))
 
         if cp.has_section("timeframes"):
             for tf in Config.TIMEFRAMES:
-                if tf in self.tf_vars:
-                    self.tf_vars[tf].set(cp.getboolean("timeframes", tf, fallback=True))
+                self.tf_vars[tf].set(cp["timeframes"].getboolean(tf))
 
     def _save_state(self):
         cp = configparser.ConfigParser()
-
-        # Use wm_geometry() (frame-relative +x+y) instead of winfo_x()/winfo_y()
-        # (client-area-relative) so save and restore use the same coordinate
-        # system. Mixing them causes the "offset by ~37px from top" drift on
-        # each launch.
-        geo = self.wm_geometry()  # e.g. "1000x800+120+80"
-        try:
-            size_part, x_part, y_part = geo.replace("+-", "+-").split("+", 1)[0], None, None
-            # Robust parse: split off the size, then the two signed offsets.
-            size, rest = geo.split("+", 1)
-            x_str, y_str = rest.split("+", 1)
-            # Handle negative offsets like "1000x800+-10+-5"
-            if y_str.startswith("-"):
-                x_val, y_val = x_str, y_str
-            else:
-                x_val, y_val = x_str, y_str
-        except ValueError:
-            x_val = str(self.winfo_x())
-            y_val = str(self.winfo_y())
-
-        cp["window"] = {"x": str(x_val), "y": str(y_val)}
+        cp["window"] = {"geometry": self.wm_geometry()}
         cp["paths"] = {"csv_folder": str(self.csv_var.get()), "model_folder": str(self.model_var.get())}
         cp["params"] = {
             "algorithm": self.algo.get(),
             "timesteps": self.timesteps.get(),
             "learning_rate": self.lr.get(),
+            "onnx_export": str(self.onnx_var.get()),
         }
         cp["timeframes"] = {tf: str(var.get()) for tf, var in self.tf_vars.items()}
 
@@ -511,29 +479,40 @@ class FinRLTrainerGUI(ctk.CTk):
             cp.write(f)
 
     def _create_ui(self):
-        main = ctk.CTkFrame(self, fg_color="transparent")
-        main.pack(fill="both", expand=True, padx=10, pady=5)
-        title = ctk.CTkFrame(main, corner_radius=6)
-        title.pack(fill="x", pady=(0, 4))
+        main_frame = ctk.CTkFrame(self, fg_color="transparent")
+        main_frame.pack(fill="both", expand=True, padx=10, pady=5)
 
-        ctk.CTkLabel(title, text="Copyright Su Nie | BSD-3C License | https://github.com/can87683", font=("Ubuntu", 16), text_color="yellow").pack(pady=(0, 4))
-        ctk.CTkLabel(title, text="🎯 FinRL Model Trainer", font=("Ubuntu", 20, "bold")).pack(pady=4)
-        UsageRow(main)
+        title_frame = ctk.CTkFrame(main_frame, corner_radius=6)
+        title_frame.pack(fill="x", pady=(0, 4))
 
-        self._create_csv(main)
-        self._create_model(main)
-        self._create_params(main)
-        self._create_tfs(main)
-        self._create_ctrls(main)
-        self._create_stat(main)
-        self._create_log(main)
+        ctk.CTkLabel(
+            title_frame,
+            text="Copyright Su Nie | BSD-3C License | https://github.com/can87683",
+            font=("TkDefaultFont", 14),
+            text_color="yellow",
+        ).pack(pady=(0, 2))
+
+        ctk.CTkLabel(
+            title_frame,
+            text="FinRL Model Trainer",
+            font=("TkDefaultFont", 16, "bold"),
+        ).pack(pady=4)
+
+        self.usage_row = UsageRow(main_frame)
+        self._create_csv(main_frame)
+        self._create_model(main_frame)
+        self._create_params(main_frame)
+        self._create_tfs(main_frame)
+        self._create_ctrls(main_frame)
+        self._create_stat(main_frame)
+        self._create_log(main_frame)
 
     def _create_csv(self, parent):
         frame = ctk.CTkFrame(parent, corner_radius=6)
         frame.pack(fill="x", pady=(0, 4))
         folder_frame = ctk.CTkFrame(frame, fg_color="transparent")
         folder_frame.pack(fill="x", padx=8, pady=3)
-        ctk.CTkButton(folder_frame, text="📁 CSV Folder", command=self.select_csv, width=120, height=28).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(folder_frame, text="CSV Folder", command=self.select_csv, width=120, height=28).pack(side="left", padx=(0, 6))
         self.csv_var = tk.StringVar(value=str(self.csv_folder))
         ctk.CTkEntry(folder_frame, textvariable=self.csv_var, state="readonly", height=28).pack(side="left", fill="x", expand=True)
 
@@ -542,10 +521,10 @@ class FinRLTrainerGUI(ctk.CTk):
         frame.pack(fill="x", pady=(0, 4))
         folder_frame = ctk.CTkFrame(frame, fg_color="transparent")
         folder_frame.pack(fill="x", padx=8, pady=3)
-        ctk.CTkButton(folder_frame, text="📁 Model Folder", command=self.select_model, width=120, height=28).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(folder_frame, text="Model Folder", command=self.select_model, width=120, height=28).pack(side="left", padx=(0, 6))
         self.model_var = tk.StringVar(value=str(self.model_folder))
         ctk.CTkEntry(folder_frame, textvariable=self.model_var, state="readonly", height=28).pack(side="left", fill="x", expand=True)
-        self.stat_lbl = ctk.CTkLabel(frame, text="📊 Status: Ready", font=("Ubuntu", 10))
+        self.stat_lbl = ctk.CTkLabel(frame, text="Status: Ready", font=("TkDefaultFont", 10))
         self.stat_lbl.pack(anchor="w", padx=8, pady=1)
 
     def _create_params(self, parent):
@@ -572,30 +551,41 @@ class FinRLTrainerGUI(ctk.CTk):
         frame.pack(fill="x", pady=(0, 4))
         tf_frame = ctk.CTkFrame(frame, fg_color="transparent")
         tf_frame.pack(fill="x", padx=8, pady=3)
-        ctk.CTkLabel(tf_frame, text="Timeframes (one model each):", font=("Ubuntu", 10)).pack(anchor="w", pady=(0, 2))
+        ctk.CTkLabel(tf_frame, text="Timeframes (one model each):", font=("TkDefaultFont", 10)).pack(anchor="w", pady=(0, 2))
         self.tf_vars = {}
         checkboxes_frame = ctk.CTkFrame(tf_frame, fg_color="transparent")
         checkboxes_frame.pack(fill="x")
         for i, tf in enumerate(Config.TIMEFRAMES):
             var = tk.BooleanVar(value=True)
             self.tf_vars[tf] = var
-            ctk.CTkCheckBox(checkboxes_frame, text=tf, variable=var, width=70, font=("Ubuntu", 10)).grid(row=0, column=i, padx=3, sticky="w")
+            ctk.CTkCheckBox(checkboxes_frame, text=tf, variable=var, width=70, font=("TkDefaultFont", 10)).grid(row=0, column=i, padx=3, sticky="w")
 
     def _create_ctrls(self, parent):
         frame = ctk.CTkFrame(parent, corner_radius=6)
         frame.pack(fill="x", pady=(0, 4))
         button_frame = ctk.CTkFrame(frame, fg_color="transparent")
         button_frame.pack(pady=4)
+
+        self.onnx_var = tk.BooleanVar(value=True)
+        self.onnx_checkbox = ctk.CTkCheckBox(
+            button_frame,
+            text="ONNX Export",
+            variable=self.onnx_var,
+            font=("TkDefaultFont", 11),
+            width=110,
+        )
+        self.onnx_checkbox.pack(side="left", padx=(0, 12))
+
         self.train_btn = ctk.CTkButton(
-            button_frame, text="🚀 Start Training", command=self.start_train,
+            button_frame, text="Start Training", command=self.start_train,
             width=130, height=34, fg_color="#2e7d32", hover_color="#1b5e20",
-            font=("Ubuntu", 12, "bold"),
+            font=("TkDefaultFont", 12, "bold"),
         )
         self.train_btn.pack(side="left", padx=4)
         self.stop_btn = ctk.CTkButton(
-            button_frame, text="⏹️ Stop Training", command=self.stop_train,
+            button_frame, text="Stop Training", command=self.stop_train,
             width=130, height=34, fg_color="#c62828", hover_color="#b71c1c",
-            font=("Ubuntu", 12, "bold"), state="disabled",
+            font=("TkDefaultFont", 12, "bold"), state="disabled",
         )
         self.stop_btn.pack(side="left", padx=4)
 
@@ -634,40 +624,23 @@ class FinRLTrainerGUI(ctk.CTk):
             self.model_var.set(folder)
             self.model_folder = Path(folder)
             self.model_folder.mkdir(parents=True, exist_ok=True)
-            self.gui_logger.log(f"💾 Model folder set to: {self.model_folder}")
+            self.gui_logger.log(f"Model folder set to: {self.model_folder}")
 
     def scan_data(self):
         csv_folder = Path(self.csv_var.get())
-        if not csv_folder.exists():
-            self.gui_logger.log(f"❌ CSV folder not found: {csv_folder}", "error")
-            self.stat_lbl.configure(text="❌ Folder not found")
-            self.train_btn.configure(state="disabled")
-            return
-        self.gui_logger.log(f"📁 Scanning CSV folder: {csv_folder}")
+        self.gui_logger.log(f"Scanning CSV folder: {csv_folder}")
         symbols, timeframes = self.data_preparer.scan_folder(csv_folder)
-        if not symbols:
-            self.gui_logger.log("⚠️ No symbols found", "warning")
-            self.stat_lbl.configure(text="⚠️ No symbols found")
-            self.train_btn.configure(state="disabled")
-            return
-        self.stat_lbl.configure(text=f"✅ Found {len(symbols)} symbols, {len(timeframes)} timeframes")
-        self.gui_logger.log(f"✅ Loaded {len(symbols)} symbols", "success")
+        self.stat_lbl.configure(text=f"Found {len(symbols)} symbols, {len(timeframes)} timeframes")
+        self.gui_logger.log(f"Loaded {len(symbols)} symbols", "success")
         self.train_btn.configure(state="normal")
 
     def start_train(self):
         if self.is_training:
-            self.gui_logger.log("⏳ Training already in progress", "warning")
+            self.gui_logger.log("Training already in progress", "warning")
             return
 
         csv_folder = Path(self.csv_var.get())
-        if not csv_folder.exists():
-            self.gui_logger.log("❌ Invalid CSV folder", "error")
-            return
-
         selected_timeframes = [tf for tf, var in self.tf_vars.items() if var.get()]
-        if not selected_timeframes:
-            self.gui_logger.log("❌ Select at least one timeframe", "error")
-            return
 
         self.is_training = True
         self.stop_flag = False
@@ -676,25 +649,27 @@ class FinRLTrainerGUI(ctk.CTk):
 
         def training_task():
             self.gui_logger.log("=" * 60)
-            self.gui_logger.log("🚀 Starting Per-Timeframe FinRL Training")
+            self.gui_logger.log("Starting Per-Timeframe FinRL Training")
             self.gui_logger.log("=" * 60)
-            self.gui_logger.log(f"📂 CSV Folder: {csv_folder}")
+            self.gui_logger.log(f"CSV Folder: {csv_folder}")
 
             algo = self.algo.get()
             timesteps = int(self.timesteps.get())
             learning_rate = float(self.lr.get())
             model_folder = self.model_var.get()
+            export_onnx = bool(self.onnx_var.get())
+            self.gui_logger.log(f"ONNX export: {'enabled' if export_onnx else 'disabled'}")
 
             symbols, _ = self.data_preparer.scan_folder(csv_folder)
             results = {}
 
             for timeframe in selected_timeframes:
                 if self.stop_flag or self._is_closing:
-                    self.gui_logger.log("⏹️ Training stopped by user", "warning")
+                    self.gui_logger.log("Training stopped by user", "warning")
                     break
 
                 self.gui_logger.log("-" * 60)
-                self.gui_logger.log(f"▶️ Timeframe: {timeframe}")
+                self.gui_logger.log(f"Timeframe: {timeframe}")
                 self.update_stat(f"[{timeframe}] Preparing environment...")
 
                 all_dfs = []
@@ -702,13 +677,7 @@ class FinRLTrainerGUI(ctk.CTk):
                     if timeframe not in timeframes:
                         continue
                     df = self.data_preparer.load_and_prepare(symbol, timeframe, csv_folder)
-                    if df is not None:
-                        all_dfs.append(df)
-
-                if not all_dfs:
-                    self.gui_logger.log(f"⚠️ [{timeframe}] No usable data", "warning")
-                    results[timeframe] = "skipped (no data)"
-                    continue
+                    all_dfs.append(df)
 
                 combined_df = pd.concat(all_dfs, ignore_index=True)
 
@@ -716,35 +685,27 @@ class FinRLTrainerGUI(ctk.CTk):
                 trainer = StreamingFinRLTrainer(self.gui_logger.log, timeframe=timeframe)
                 self.current_trainer = trainer
 
-                success = trainer.train_single_timeframe(
-                    combined_df, timeframe,
-                    algo=algo, timesteps=timesteps, lr=learning_rate,
-                )
+                trainer.train_single_timeframe(combined_df, timeframe, algo=algo, timesteps=timesteps, lr=learning_rate)
 
-                if success and not trainer.stop_flag:
-                    if trainer.save_model(model_folder, Config.MODEL_PREFIX, timeframe):
-                        results[timeframe] = "trained"
-                    else:
-                        results[timeframe] = "save failed"
-                elif trainer.stop_flag:
+                if not trainer.stop_flag:
+                    trainer.save_model(model_folder, Config.MODEL_PREFIX, timeframe, export_onnx)
+                    results[timeframe] = "trained"
+                else:
                     results[timeframe] = "stopped"
                     self.stop_flag = True
-                else:
-                    results[timeframe] = "training failed"
 
                 del trainer
                 self.current_trainer = None
 
             summary = ", ".join(f"{tf}: {status}" for tf, status in results.items())
             self.gui_logger.log("=" * 60)
-            self.gui_logger.log(f"🏁 Summary: {summary}")
+            self.gui_logger.log(f"Summary: {summary}")
             self.update_stat(f"Done. {summary}")
 
             self.is_training = False
             self.current_trainer = None
-            if not self._is_closing:
-                self.train_btn.configure(state="normal")
-                self.stop_btn.configure(state="disabled")
+            self.train_btn.configure(state="normal")
+            self.stop_btn.configure(state="disabled")
 
         threading.Thread(target=training_task, daemon=True).start()
 
@@ -752,7 +713,7 @@ class FinRLTrainerGUI(ctk.CTk):
         self.stop_flag = True
         if self.current_trainer is not None:
             self.current_trainer.stop_training()
-        self.gui_logger.log("⏹️ Stopping training...", "warning")
+        self.gui_logger.log("Stopping training...", "warning")
 
     def _on_closing(self):
         if self._is_closing:

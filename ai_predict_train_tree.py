@@ -3,7 +3,7 @@
 # Copyright Su Nie | BSD-3C License | https://github.com/can87683
 
 """
-catboost customtkinter lightgbm numpy onnx onnxconverter-common onnxmltools pandas psutil setproctitle xgboost
+catboost customtkinter gputil lightgbm numpy onnx onnxconverter-common onnxmltools pandas psutil scikit-learn setproctitle xgboost
 """
 import os
 import sys
@@ -13,9 +13,9 @@ setproctitle.setproctitle(os.path.basename(sys.argv[0]))
 import catboost
 import configparser
 import customtkinter as ctk
-from customtkinter import CTkLabel
 import datetime
 import gc
+import GPUtil
 import json
 import lightgbm
 import numpy as np
@@ -25,7 +25,6 @@ import onnxmltools
 import pandas as pd
 import pathlib
 import psutil
-import pickle
 import queue
 import re
 import subprocess
@@ -36,6 +35,7 @@ import tkinter.messagebox as messagebox
 import traceback
 import types
 import xgboost
+import functools
 
 
 class Config:
@@ -44,17 +44,26 @@ class Config:
     DATASET_DIR = HOME / "mt5_data"
 
     REQUIRED_COLUMNS = ['time', 'open', 'high', 'low', 'close', 'tick_volume']
-    SYMBOL_PATTERN = r"[A-Za-z0-9._#+-]+"
+    FEATURE_COLUMNS = ['open', 'high', 'low', 'close', 'tick_volume']
+    SYMBOL_PATTERN = r"(?!\.)[A-Za-z0-9._#+-]+"
     MAX_ROWS_PER_SYMBOL = 20000
     WARMUP_BARS = 300
-    MIN_ROWS_AFTER_WARMUP = 100
-    FEATURE_VERSION = 2
+    MIN_ROWS_AFTER_WARMUP = 1000
     VALIDATION_FRACTION = 0.15
 
     DEFAULT_HORIZON = 10
     DEFAULT_ITERATIONS = 1000
     DEFAULT_LEARNING_RATE = 0.05
     DEFAULT_MAX_DEPTH = 6
+
+    MIN_ROWS_AFTER_WARMUP_BY_TIMEFRAME = {
+    "M5": 1000,
+    "M15": 1000,
+    "H1": 1000,
+    "H4": 1000,
+    "D1": 700,
+    "W1": 490,
+    }
 
     TIMEFRAME_HYPERPARAMS = {
         "M5":  {"max_depth": 6, "iterations": 1500, "reg_lambda": 1.0},
@@ -126,29 +135,30 @@ class GPUManager:
 
 class UsageRow:
     FRAME_HEIGHT = 40
-    FRAME_CORNER_RADIUS = 5
-    FRAME_PADY = (0, 10)
+    FRAME_CORNER_RADIUS = 2
+    FRAME_BG = "#1c1c1c"
+    FRAME_PADY = 2
 
     FONT = ("TkDefaultFont", 20)
     TEXT_COLOR = "Lime"
     PLACEHOLDER_TEXT = "Loading system usage..."
 
-    LABEL_PADX = 10
-    LABEL_PADY = 5
+    LABEL_PADX = 2
+    LABEL_PADY = 2
 
     REFRESH_MS = 2000
-    CPU_SAMPLE_INTERVAL = 0.5
 
     def __init__(self, parent):
         self.usage_frame = ctk.CTkFrame(
             parent,
             height=self.FRAME_HEIGHT,
             corner_radius=self.FRAME_CORNER_RADIUS,
+            fg_color=self.FRAME_BG,
         )
         self.usage_frame.pack(fill="x", pady=self.FRAME_PADY)
         self.usage_frame.pack_propagate(False)
 
-        self.usage_label = CTkLabel(
+        self.usage_label = ctk.CTkLabel(
             self.usage_frame,
             text=self.PLACEHOLDER_TEXT,
             font=self.FONT,
@@ -161,17 +171,13 @@ class UsageRow:
         self._update_usage()
 
     def _update_usage(self):
-        cpu = psutil.cpu_percent(interval=self.CPU_SAMPLE_INTERVAL)
+        cpu = psutil.cpu_percent(interval=None)
         dram = psutil.virtual_memory().percent
         gpu_percent = vram_percent = 0
-        try:
-            import GPUtil
-            gpus = GPUtil.getGPUs()
-            if gpus:
-                gpu_percent = gpus[0].load * 100
-                vram_percent = gpus[0].memoryUtil * 100
-        except ImportError:
-            pass
+        gpus = GPUtil.getGPUs()
+        if gpus:
+            gpu_percent = gpus[0].load * 100
+            vram_percent = gpus[0].memoryUtil * 100
         self.usage_label.configure(
             text=f"CPU: {cpu:.1f}%  DRAM: {dram:.1f}%  "
                  f"GPU: {gpu_percent:.1f}%  VRAM: {vram_percent:.1f}%"
@@ -192,368 +198,6 @@ class ConsoleLogger:
 
     def flush(self):
         self.original_stream.flush()
-
-
-class MemoryOptimizer:
-    @staticmethod
-    def get_system_memory_available_gb():
-        return psutil.virtual_memory().available / 1e9
-
-    @staticmethod
-    def clear_cache():
-        gc.collect()
-
-
-class FeatureEngineer:
-    RETURN_LAGS = (1, 2, 3, 5, 10, 20, 60)
-    VOL_WINDOWS = (10, 20, 60)
-    PARKINSON_WINDOW = 20
-    ZSCORE_WINDOW = 20
-    VOLUME_WINDOW = 20
-    RANGE_WINDOWS = (20, 60)
-    ER_WINDOW = 20
-    SLOPE_WINDOW = 20
-    DIST_WINDOW = 60
-    DD_WINDOW = 60
-    GK_WINDOW = 20
-
-    ADX_PERIOD = 14
-    ATR_PERIOD = 14
-    BB_PERIOD = 20
-    BB_STD = 2.0
-    CCI_PERIOD = 20
-    EMA_SPANS = (12, 26, 50, 200)
-    KC_PERIOD = 20
-    KC_MULT = 2.0
-    MACD_FAST = 12
-    MACD_SLOW = 26
-    MACD_SIGNAL = 9
-    MFI_PERIOD = 14
-    OBV_WINDOW = 20
-    ROC_PERIOD = 12
-    RSI_PERIOD = 14
-    SMA_WINDOWS = (20, 50, 200)
-    STOCH_PERIOD = 14
-    STOCH_SMOOTH = 3
-    VOLMA_WINDOW = 20
-    VWAP_WINDOW = 20
-    WILLR_PERIOD = 14
-
-    INDICATORS = {
-        'enable_adx': True,
-        'enable_atr': True,
-        'enable_bb': True,
-        'enable_cci': False,
-        'enable_ema': True,
-        'enable_kc': False,
-        'enable_macd': False,
-        'enable_mfi': True,
-        'enable_obv': True,
-        'enable_roc': False,
-        'enable_rsi': True,
-        'enable_sma': False,
-        'enable_stochastic': False,
-        'enable_vol_ma': False,
-        'enable_vwap': False,
-        'enable_willr': False,
-    }
-
-    RAW_FEATURES = [c for c in Config.REQUIRED_COLUMNS if c != 'time']
-    TIME_FEATURES = ['hour_sin', 'hour_cos', 'day_sin', 'day_cos', 'month_sin', 'month_cos']
-    BASE_FEATURES = (
-        RAW_FEATURES
-        + TIME_FEATURES
-        + ['high_low_ratio', 'close_high_ratio', 'close_low_ratio', 'body_ratio', 'upper_wick', 'lower_wick']
-        + [f"ret_{n}" for n in RETURN_LAGS]
-        + [f"vol_{w}" for w in VOL_WINDOWS]
-        + ['vol_ratio', 'parkinson', 'ret_z', 'tick_volume_ratio', 'tick_volume_chg']
-        + ['gap', 'garman_klass', f"er_{ER_WINDOW}", f"slope_atr_{SLOPE_WINDOW}", f"skew_{DIST_WINDOW}", f"kurt_{DIST_WINDOW}", f"drawdown_{DD_WINDOW}"]
-        + [f"range_pos_{w}" for w in RANGE_WINDOWS]
-        + [f"since_high_{w}" for w in RANGE_WINDOWS]
-        + [f"since_low_{w}" for w in RANGE_WINDOWS]
-    )
-
-    FLAG_TO_FEATURES = {
-        'enable_adx': ['adx', 'plus_di', 'minus_di'],
-        'enable_atr': ['atr_pct'],
-        'enable_bb': ['bb_percent', 'bb_width'],
-        'enable_cci': ['cci'],
-        'enable_ema': [f"ema_{s}_rel" for s in EMA_SPANS],
-        'enable_kc': ['kc_percent', 'kc_width'],
-        'enable_macd': ['macd', 'macd_signal', 'macd_hist'],
-        'enable_mfi': ['mfi'],
-        'enable_obv': ['obv_rel'],
-        'enable_roc': ['roc'],
-        'enable_rsi': ['rsi'],
-        'enable_sma': [f"sma_{s}_rel" for s in SMA_WINDOWS],
-        'enable_stochastic': ['stoch_k', 'stoch_d'],
-        'enable_vol_ma': [f"volume_ema_{VOLMA_WINDOW}_rel", f"volume_sma_{VOLMA_WINDOW}_rel"],
-        'enable_vwap': ['vwap_rel'],
-        'enable_willr': ['willr'],
-    }
-
-    @staticmethod
-    def feature_names():
-        names = list(FeatureEngineer.BASE_FEATURES)
-        for flag, cols in FeatureEngineer.FLAG_TO_FEATURES.items():
-            if FeatureEngineer.INDICATORS[flag]:
-                names.extend(cols)
-        return names
-
-    @classmethod
-    def add_features(cls, df):
-        df = df.copy()
-        t = df['time']
-        o, h, l, c, v = df['open'], df['high'], df['low'], df['close'], df['tick_volume']
-
-        hour = t.dt.hour + t.dt.minute / 60
-        df['hour_sin'] = np.sin(2 * np.pi * hour / 24)
-        df['hour_cos'] = np.cos(2 * np.pi * hour / 24)
-        df['day_sin'] = np.sin(2 * np.pi * t.dt.dayofweek / 7)
-        df['day_cos'] = np.cos(2 * np.pi * t.dt.dayofweek / 7)
-        df['month_sin'] = np.sin(2 * np.pi * t.dt.month / 12)
-        df['month_cos'] = np.cos(2 * np.pi * t.dt.month / 12)
-
-        rng = (h - l).replace(0, np.nan)
-        df['high_low_ratio'] = h / l
-        df['close_high_ratio'] = c / h
-        df['close_low_ratio'] = c / l
-        df['body_ratio'] = (c - o) / rng
-        df['upper_wick'] = (h - np.maximum(o, c)) / rng
-        df['lower_wick'] = (np.minimum(o, c) - l) / rng
-
-        log_close = np.log(c)
-        ret1 = log_close.diff()
-
-        for n in cls.RETURN_LAGS:
-            df[f"ret_{n}"] = log_close.diff(n)
-
-        for w in cls.VOL_WINDOWS:
-            df[f"vol_{w}"] = ret1.rolling(w).std()
-
-        df['vol_ratio'] = (
-            df[f"vol_{cls.VOL_WINDOWS[0]}"]
-            / df[f"vol_{cls.VOL_WINDOWS[-1]}"].replace(0, np.nan)
-        )
-        df['parkinson'] = np.sqrt(
-            (np.log(h / l) ** 2).rolling(cls.PARKINSON_WINDOW).mean()
-            / (4 * np.log(2))
-        )
-        df['ret_z'] = (
-            (ret1 - ret1.rolling(cls.ZSCORE_WINDOW).mean())
-            / ret1.rolling(cls.ZSCORE_WINDOW).std().replace(0, np.nan)
-        )
-        df['tick_volume_ratio'] = v / v.rolling(cls.VOLUME_WINDOW).mean().replace(0, np.nan)
-        df['tick_volume_chg'] = np.log(v.replace(0, np.nan)).diff()
-
-        typical = (h + l + c) / 3
-        prev_close = c.shift(1)
-        true_range = pd.concat(
-            [h - l, (h - prev_close).abs(), (l - prev_close).abs()],
-            axis=1,
-        ).max(axis=1)
-
-        df['gap'] = o / prev_close - 1
-        gk = (
-            0.5 * np.log(h / l) ** 2
-            - (2 * np.log(2) - 1) * np.log(c / o) ** 2
-        )
-        df['garman_klass'] = np.sqrt(
-            gk.rolling(cls.GK_WINDOW).mean().clip(lower=0)
-        )
-        df[f"er_{cls.ER_WINDOW}"] = (
-            (c - c.shift(cls.ER_WINDOW)).abs()
-            / c.diff().abs().rolling(cls.ER_WINDOW).sum().replace(0, np.nan)
-        )
-
-        slope_x = np.arange(cls.SLOPE_WINDOW) - (cls.SLOPE_WINDOW - 1) / 2
-        slope = c.rolling(cls.SLOPE_WINDOW).apply(
-            lambda y: np.dot(slope_x, y) / np.dot(slope_x, slope_x),
-            raw=True,
-        )
-        atr_slope = true_range.ewm(
-            alpha=1 / cls.ATR_PERIOD,
-            min_periods=1,
-            adjust=False,
-        ).mean()
-        df[f"slope_atr_{cls.SLOPE_WINDOW}"] = slope / atr_slope.replace(0, np.nan)
-
-        df[f"skew_{cls.DIST_WINDOW}"] = ret1.rolling(cls.DIST_WINDOW).skew()
-        df[f"kurt_{cls.DIST_WINDOW}"] = ret1.rolling(cls.DIST_WINDOW).kurt()
-        df[f"drawdown_{cls.DD_WINDOW}"] = c / c.rolling(cls.DD_WINDOW).max() - 1
-
-        for w in cls.RANGE_WINDOWS:
-            lowest = l.rolling(w).min()
-            highest = h.rolling(w).max()
-            df[f"range_pos_{w}"] = (
-                (c - lowest) / (highest - lowest).replace(0, np.nan)
-            )
-            df[f"since_high_{w}"] = h.rolling(w).apply(
-                lambda x: np.argmax(x[::-1]) / len(x),
-                raw=True,
-            )
-            df[f"since_low_{w}"] = l.rolling(w).apply(
-                lambda x: np.argmin(x[::-1]) / len(x),
-                raw=True,
-            )
-
-        if cls.INDICATORS['enable_adx']:
-            a = 1 / cls.ADX_PERIOD
-            up = h.diff()
-            down = -l.diff()
-            plus_dm = up.where((up > down) & (up > 0), 0.0)
-            minus_dm = down.where((down > up) & (down > 0), 0.0)
-            atr = true_range.ewm(alpha=a, min_periods=1, adjust=False).mean().replace(0, np.nan)
-            plus_di = 100 * plus_dm.ewm(alpha=a, min_periods=1, adjust=False).mean() / atr
-            minus_di = 100 * minus_dm.ewm(alpha=a, min_periods=1, adjust=False).mean() / atr
-            dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-            df['plus_di'] = plus_di
-            df['minus_di'] = minus_di
-            df['adx'] = dx.ewm(alpha=a, min_periods=1, adjust=False).mean()
-
-        if cls.INDICATORS['enable_atr']:
-            df['atr_pct'] = (
-                true_range.ewm(
-                    alpha=1 / cls.ATR_PERIOD,
-                    min_periods=1,
-                    adjust=False,
-                ).mean() / c
-            )
-
-        if cls.INDICATORS['enable_bb']:
-            middle = c.rolling(cls.BB_PERIOD, min_periods=1).mean()
-            std = c.rolling(cls.BB_PERIOD, min_periods=1).std()
-            upper = middle + cls.BB_STD * std
-            lower = middle - cls.BB_STD * std
-            df['bb_width'] = (upper - lower) / middle.replace(0, np.nan)
-            df['bb_percent'] = (c - lower) / (upper - lower).replace(0, np.nan)
-
-        if cls.INDICATORS['enable_cci']:
-            sma_typ = typical.rolling(cls.CCI_PERIOD, min_periods=1).mean()
-            mean_dev = typical.rolling(cls.CCI_PERIOD, min_periods=1).apply(
-                lambda x: np.mean(np.abs(x - np.mean(x))),
-                raw=True,
-            )
-            df['cci'] = (typical - sma_typ) / (0.015 * mean_dev.replace(0, np.nan))
-
-        if cls.INDICATORS['enable_ema']:
-            for s in cls.EMA_SPANS:
-                df[f"ema_{s}_rel"] = (
-                    c / c.ewm(span=s, min_periods=1, adjust=False).mean() - 1
-                )
-
-        if cls.INDICATORS['enable_kc']:
-            middle = typical.rolling(cls.KC_PERIOD, min_periods=1).mean()
-            atr = true_range.ewm(
-                alpha=1 / cls.KC_PERIOD,
-                min_periods=1,
-                adjust=False,
-            ).mean()
-            upper = middle + cls.KC_MULT * atr
-            lower = middle - cls.KC_MULT * atr
-            df['kc_width'] = (upper - lower) / middle.replace(0, np.nan)
-            df['kc_percent'] = (c - lower) / (upper - lower).replace(0, np.nan)
-
-        if cls.INDICATORS['enable_macd']:
-            macd = (
-                c.ewm(span=cls.MACD_FAST, adjust=False).mean()
-                - c.ewm(span=cls.MACD_SLOW, adjust=False).mean()
-            )
-            signal = macd.ewm(span=cls.MACD_SIGNAL, adjust=False).mean()
-            df['macd'] = macd / c
-            df['macd_signal'] = signal / c
-            df['macd_hist'] = (macd - signal) / c
-
-        if cls.INDICATORS['enable_mfi']:
-            raw_money = typical * v
-            diff = typical.diff()
-            positive = raw_money.where(diff > 0, 0.0).rolling(
-                cls.MFI_PERIOD,
-                min_periods=1,
-            ).sum()
-            negative = raw_money.where(diff < 0, 0.0).rolling(
-                cls.MFI_PERIOD,
-                min_periods=1,
-            ).sum()
-
-            money_ratio = positive / negative.replace(0, np.nan)
-            mfi = 100 - 100 / (1 + money_ratio)
-            mfi = mfi.mask((negative == 0) & (positive > 0), 100.0)
-            mfi = mfi.mask((positive == 0) & (negative > 0), 0.0)
-            mfi = mfi.mask((positive == 0) & (negative == 0), 50.0)
-            df['mfi'] = mfi
-
-        if cls.INDICATORS['enable_obv']:
-            signed = np.sign(c.diff()).fillna(0.0) * v
-            df['obv_rel'] = (
-                signed.rolling(cls.OBV_WINDOW).sum()
-                / v.rolling(cls.OBV_WINDOW).sum().replace(0, np.nan)
-            )
-
-        if cls.INDICATORS['enable_roc']:
-            df['roc'] = (
-                (c - c.shift(cls.ROC_PERIOD))
-                / c.shift(cls.ROC_PERIOD).replace(0, np.nan)
-            ) * 100
-
-        if cls.INDICATORS['enable_rsi']:
-            delta = c.diff()
-            avg_gain = delta.clip(lower=0).ewm(
-                alpha=1 / cls.RSI_PERIOD,
-                min_periods=1,
-                adjust=False,
-            ).mean()
-            avg_loss = (-delta).clip(lower=0).ewm(
-                alpha=1 / cls.RSI_PERIOD,
-                min_periods=1,
-                adjust=False,
-            ).mean()
-
-            relative_strength = avg_gain / avg_loss.replace(0, np.nan)
-            rsi = 100 - 100 / (1 + relative_strength)
-            rsi = rsi.mask((avg_loss == 0) & (avg_gain > 0), 100.0)
-            rsi = rsi.mask((avg_gain == 0) & (avg_loss > 0), 0.0)
-            rsi = rsi.mask((avg_gain == 0) & (avg_loss == 0), 50.0)
-            df['rsi'] = rsi
-
-        if cls.INDICATORS['enable_sma']:
-            for s in cls.SMA_WINDOWS:
-                df[f"sma_{s}_rel"] = c / c.rolling(s, min_periods=1).mean() - 1
-
-        if cls.INDICATORS['enable_stochastic']:
-            lowest = l.rolling(cls.STOCH_PERIOD, min_periods=1).min()
-            highest = h.rolling(cls.STOCH_PERIOD, min_periods=1).max()
-            k = 100 * (c - lowest) / (highest - lowest).replace(0, np.nan)
-            df['stoch_k'] = k
-            df['stoch_d'] = k.rolling(cls.STOCH_SMOOTH, min_periods=1).mean()
-
-        if cls.INDICATORS['enable_vol_ma']:
-            df[f"volume_ema_{cls.VOLMA_WINDOW}_rel"] = (
-                v / v.ewm(
-                    span=cls.VOLMA_WINDOW,
-                    min_periods=1,
-                    adjust=False,
-                ).mean().replace(0, np.nan) - 1
-            )
-            df[f"volume_sma_{cls.VOLMA_WINDOW}_rel"] = (
-                v / v.rolling(cls.VOLMA_WINDOW, min_periods=1).mean().replace(0, np.nan) - 1
-            )
-
-        if cls.INDICATORS['enable_vwap']:
-            vwap = (
-                (typical * v).rolling(cls.VWAP_WINDOW, min_periods=1).sum()
-                / v.rolling(cls.VWAP_WINDOW, min_periods=1).sum().replace(0, np.nan)
-            )
-            df['vwap_rel'] = c / vwap - 1
-
-        if cls.INDICATORS['enable_willr']:
-            lowest = l.rolling(cls.WILLR_PERIOD, min_periods=1).min()
-            highest = h.rolling(cls.WILLR_PERIOD, min_periods=1).max()
-            df['willr'] = (
-                -100 * (highest - c) / (highest - lowest).replace(0, np.nan)
-            )
-
-        return df
 
 
 class GUILogger:
@@ -616,6 +260,16 @@ class GUILogger:
         self.ready = False
         sys.stdout = self._original_stdout
         sys.stderr = self._original_stderr
+
+
+class MemoryOptimizer:
+    @staticmethod
+    def get_system_memory_available_gb():
+        return psutil.virtual_memory().available / 1e9
+
+    @staticmethod
+    def clear_cache():
+        gc.collect()
 
 
 class StreamingDataPreparer:
@@ -758,78 +412,130 @@ class StreamingDataPreparer:
 
         return symbols, sorted(all_timeframes)
 
-    def build_dataframe_for_symbol(self, csv_folder, symbol, timeframe, horizon):
+    def build_dataframe_for_symbol(
+        self,
+        csv_folder,
+        symbol,
+        timeframe,
+        horizon,
+    ):
         if horizon < 1:
-            raise ValueError("Prediction horizon must be at least 1 bar")
+            raise ValueError(
+                "Prediction horizon must be at least 1 bar"
+            )
 
-        df = self.load_csv_data(symbol, timeframe, csv_folder)
+        feature_cols = list(Config.FEATURE_COLUMNS)
 
-        if len(df) < Config.WARMUP_BARS + horizon + Config.MIN_ROWS_AFTER_WARMUP:
+        df = self.load_csv_data(
+            symbol,
+            timeframe,
+            csv_folder,
+        )
+
+        minimum_rows = Config.MIN_ROWS_AFTER_WARMUP_BY_TIMEFRAME[timeframe]
+        required_rows = Config.WARMUP_BARS + horizon + minimum_rows
+
+        self._log(
+            f"🔎 {symbol}_{timeframe}: {len(df):,} valid bars, "
+            f"{required_rows:,} required "
+            f"(warmup={Config.WARMUP_BARS}, horizon={horizon}, "
+            f"minimum_training={minimum_rows})"
+        )
+
+        if len(df) < required_rows:
             self._log(
                 f"⚠️ {symbol}_{timeframe}: insufficient valid rows after cleaning"
             )
             return None
 
         df = df.iloc[-Config.MAX_ROWS_PER_SYMBOL:].copy()
-        df = FeatureEngineer.add_features(df)
-
-        features = FeatureEngineer.feature_names()
-
-        df[features] = (
-            df[features]
-            .replace([np.inf, -np.inf], np.nan)
-            .ffill()
-            .fillna(0.0)
-        )
 
         df["target"] = df["close"].shift(-horizon)
-        df = df.iloc[Config.WARMUP_BARS:].dropna(subset=["target"])
+
+        df = df.iloc[Config.WARMUP_BARS:].copy()
+
+        df[feature_cols] = (
+            df[feature_cols]
+            .replace([np.inf, -np.inf], np.nan)
+        )
+
+        df = df.dropna(
+            subset=feature_cols + ["target"]
+        )
 
         if df.empty:
             self._log(
-                f"⚠️ {symbol}_{timeframe}: no training rows remain after feature preparation"
+                f"⚠️ {symbol}_{timeframe}: no training rows remain "
+                "after OHLCV preparation"
             )
             return None
 
-        self.feature_cols = features
+        values = df[feature_cols].to_numpy(dtype=np.float64)
+
+        if not np.isfinite(values).all():
+            raise ValueError(
+                f"{symbol}_{timeframe}: OHLCV contains non-finite values"
+            )
+
+        if (df["high"] < df["low"]).any():
+            raise ValueError(
+                f"{symbol}_{timeframe}: high is below low"
+            )
+
+        if (
+            (df[["open", "high", "low", "close"]] <= 0).any().any()
+            or (df["tick_volume"] < 0).any()
+        ):
+            raise ValueError(
+                f"{symbol}_{timeframe}: invalid OHLCV values"
+            )
+
+        self.feature_cols = feature_cols
 
         self._log(
             f"📊 {symbol}_{timeframe}: {len(df):,} rows, "
-            f"{len(features)} features"
+            f"{len(feature_cols)} OHLCV features"
         )
 
-        return df[["time", "target"] + features].reset_index(drop=True)
+        return df[
+            ["time", "target"] + feature_cols
+        ].reset_index(drop=True)
 
 
-class StreamingLightGBMTrainer:
-    MODEL_PREFIX = "ai_predict_lightgbm"
-    MODEL_EXT = ".lgb.txt"
+class StreamingTreeTrainer:
+    BACKENDS = {
+        "LightGBM": {"prefix": "ai_predict_lightgbm", "ext": ".lgb.txt", "model_type": "lightgbm.LGBMRegressor", "reg_lambda": 1.0},
+        "XGBoost": {"prefix": "ai_predict_xgboost", "ext": ".xgb.json", "model_type": "xgboost.XGBRegressor", "reg_lambda": 1.0},
+        "CatBoost": {"prefix": "ai_predict_catboost", "ext": ".cbm", "model_type": "catboost.CatBoostRegressor", "reg_lambda": 3.0},
+    }
     ONNX_EXT = ".onnx"
-    META_EXT = ".meta.txt"
     INFO_EXT = ".info.json"
     ONNX_OPSET = 14
     LOG_EVERY_ROUNDS = 10
     TOP_IMPORTANCE = 10
     EARLY_STOPPING_ROUNDS = 100
-    MIN_CHILD_SAMPLES = 100
-    NUM_LEAVES = 63
-    SUBSAMPLE = 0.8
-    SUBSAMPLE_FREQ = 1
-    COLSAMPLE_BYTREE = 0.8
-    REG_LAMBDA = 1.0
     RANDOM_STATE = 42
+    SUBSAMPLE = 0.8
+    COLSAMPLE_BYTREE = 0.8
+    LGBM_MIN_CHILD_SAMPLES = 100
+    LGBM_NUM_LEAVES = 63
+    LGBM_SUBSAMPLE_FREQ = 1
+    XGB_MIN_CHILD_WEIGHT = 10
 
-    def __init__(self, log_callback, symbol, timeframe):
+    def __init__(self, log_callback, symbol, timeframe, backend):
         self.log_callback = log_callback
         self.symbol = symbol
         self.timeframe = timeframe
+        self.backend = backend
+        self.MODEL_PREFIX = self.BACKENDS[backend]["prefix"]
+        self.MODEL_EXT = self.BACKENDS[backend]["ext"]
         self.model = None
         self.is_trained = False
         self.stop_flag = False
         self.training_history = {}
         self.importance = {}
         self.parity_row = None
-        self._log(f"🚀 LightGBM trainer [{symbol} {timeframe}] initialized (CPU)")
+        self._log(f"🚀 {backend} trainer [{symbol} {timeframe}] initialized (CPU)")
 
     def _log(self, message):
         self.log_callback(message)
@@ -838,31 +544,7 @@ class StreamingLightGBMTrainer:
         self.stop_flag = True
         self._log("⏹️ Training stop requested")
 
-    def train_single_timeframe(self, data, feature_cols, iterations, learning_rate, max_depth, horizon, status_callback):
-        self.stop_flag = False
-        tag = f"{self.symbol} {self.timeframe}"
-
-        hp = Config.TIMEFRAME_HYPERPARAMS[self.timeframe]
-        n_estimators = iterations or hp["iterations"]
-        depth = max_depth or hp["max_depth"]
-        reg_lambda = self.REG_LAMBDA if iterations else hp["reg_lambda"]
-
-        self.parity_row = data.iloc[-1][["time"] + feature_cols]
-
-        n_val = max(1, int(len(data) * Config.VALIDATION_FRACTION))
-        train_df = data.iloc[:len(data) - n_val - horizon]
-        val_df = data.iloc[len(data) - n_val:]
-
-        X_train = train_df[feature_cols].to_numpy(dtype=np.float32)
-        y_train = (train_df["target"] / train_df["close"] - 1.0).to_numpy(dtype=np.float32)
-        X_val = val_df[feature_cols].to_numpy(dtype=np.float32)
-        y_val = (val_df["target"] / val_df["close"] - 1.0).to_numpy(dtype=np.float32)
-        del train_df, val_df
-
-        self._log(f"[{tag}] Train rows: {len(y_train):,}, Val rows: {len(y_val):,}, Embargo: {horizon} bars")
-        self._log(f"[{tag}] Model features ({len(feature_cols)}): {', '.join(feature_cols)}")
-        self._log(f"[{tag}] Trees: {n_estimators}, depth: {depth}, lr: {learning_rate}, L2: {reg_lambda}")
-
+    def _fit_lightgbm(self, X_train, y_train, X_val, y_val, n_estimators, depth, learning_rate, reg_lambda, tag, status_callback):
         def progress(env):
             if self.stop_flag:
                 raise lightgbm.callback.EarlyStopException(env.iteration, env.evaluation_result_list)
@@ -875,10 +557,10 @@ class StreamingLightGBMTrainer:
             n_estimators=n_estimators,
             learning_rate=learning_rate,
             max_depth=depth,
-            num_leaves=self.NUM_LEAVES,
-            min_child_samples=self.MIN_CHILD_SAMPLES,
+            num_leaves=self.LGBM_NUM_LEAVES,
+            min_child_samples=self.LGBM_MIN_CHILD_SAMPLES,
             subsample=self.SUBSAMPLE,
-            subsample_freq=self.SUBSAMPLE_FREQ,
+            subsample_freq=self.LGBM_SUBSAMPLE_FREQ,
             colsample_bytree=self.COLSAMPLE_BYTREE,
             reg_lambda=reg_lambda,
             random_state=self.RANDOM_STATE,
@@ -891,220 +573,8 @@ class StreamingLightGBMTrainer:
             eval_metric="l2",
             callbacks=[lightgbm.early_stopping(self.EARLY_STOPPING_ROUNDS, verbose=False), progress],
         )
-        self.is_trained = True
 
-        gain = self.model.booster_.feature_importance(importance_type="gain")
-        gain = 100 * gain / max(gain.sum(), 1e-12)
-        self.importance = dict(zip(feature_cols, gain.round(4).tolist()))
-
-        predicted = self.model.predict(X_val)
-        valid_mask = y_val != 0
-        self.training_history.update({
-            "symbol": self.symbol,
-            "timeframe": self.timeframe,
-            "best_rounds": int(self.model.best_iteration_),
-            "rounds_run": int(self.model.booster_.current_iteration()),
-            "val_l2": float(np.mean((predicted - y_val) ** 2)),
-            "directional_accuracy": float((np.sign(predicted[valid_mask]) == np.sign(y_val[valid_mask])).mean()),
-        })
-        top = sorted(self.importance.items(), key=lambda item: -item[1])[:self.TOP_IMPORTANCE]
-        self._log(f"[{tag}] Top gain %: " + ", ".join(f"{k}={v:.1f}" for k, v in top))
-        self._log(f"[{tag}] Zero-importance features: {sum(1 for v in self.importance.values() if v == 0)}")
-        self._log(f"[{tag}] Directional accuracy: {self.training_history['directional_accuracy'] * 100:.1f}%")
-        return self.is_trained
-
-    def save_model(self, model_dir, filename_stem, feature_cols, horizon, export_onnx):
-        output_dir = pathlib.Path(model_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        model_path = output_dir / f"{filename_stem}{self.MODEL_EXT}"
-        onnx_path = output_dir / f"{filename_stem}{self.ONNX_EXT}"
-        pkl_path = output_dir / f"{filename_stem}.pkl"
-
-        self.model.booster_.save_model(str(model_path))
-
-        onnx_input = None
-        onnx_output = None
-
-        if export_onnx:
-            onnx_model = onnxmltools.convert_lightgbm(
-                self.model,
-                initial_types=[
-                    (
-                        "input",
-                        onnxconverter_common.data_types.FloatTensorType(
-                            [1, len(feature_cols)]
-                        ),
-                    )
-                ],
-                target_opset=self.ONNX_OPSET,
-            )
-
-            for key, value in (
-                ("features", ",".join(feature_cols)),
-                ("feature_version", str(Config.FEATURE_VERSION)),
-            ):
-                entry = onnx_model.metadata_props.add()
-                entry.key = key
-                entry.value = value
-
-            onnx_path.write_bytes(onnx_model.SerializeToString())
-            onnx_input = onnx_model.graph.input[0].name
-            onnx_output = onnx_model.graph.output[0].name
-            del onnx_model
-
-        artifact = {
-            "model_type": "lightgbm.LGBMRegressor",
-            "target_type": "forward_return",
-            "feature_version": Config.FEATURE_VERSION,
-            "symbol": self.symbol,
-            "timeframe": self.timeframe,
-            "horizon": horizon,
-            "warmup_bars": Config.WARMUP_BARS,
-            "feature_columns": list(feature_cols),
-            "feature_importance": self.importance,
-            "model_path": str(model_path),
-            "onnx_path": str(onnx_path) if export_onnx else None,
-            "training_history": self.training_history,
-            "training_time": datetime.datetime.now().isoformat(),
-            "dtype": "float32",
-            "fill": "inf_to_nan,ffill,zero",
-            "target": "close[t+horizon]/close[t]-1",
-            "time": "bar_open_csv_timezone",
-            "onnx_input": onnx_input,
-            "onnx_output": onnx_output,
-            "parity_timestamp": self.parity_row["time"].value // 10**9,
-            "parity_features": {
-                column: float(self.parity_row[column])
-                for column in feature_cols
-            },
-        }
-
-        with open(pkl_path, "wb") as file:
-            pickle.dump(artifact, file, protocol=pickle.HIGHEST_PROTOCOL)
-
-        self._log(f"✅ LightGBM model saved: {model_path}")
-
-        if export_onnx:
-            self._log(f"✅ ONNX model saved: {onnx_path}")
-
-        self._log(f"✅ PKL metadata saved: {pkl_path}")
-
-
-class StreamingXGBoostTrainer:
-    MODEL_PREFIX = "ai_predict_xgboost"
-    MODEL_EXT = ".xgb.json"
-    ONNX_EXT = ".onnx"
-    META_EXT = ".meta.txt"
-    INFO_EXT = ".info.json"
-    ONNX_OPSET = 14
-    LOG_EVERY_ROUNDS = 10
-    TOP_IMPORTANCE = 10
-    EARLY_STOPPING_ROUNDS = 100
-    MIN_CHILD_WEIGHT = 10
-    SUBSAMPLE = 0.8
-    COLSAMPLE_BYTREE = 0.8
-    REG_LAMBDA = 1.0
-    RANDOM_STATE = 42
-
-    def __init__(self, log_callback, symbol, timeframe):
-        self.log_callback = log_callback
-        self.symbol = symbol
-        self.timeframe = timeframe
-        self.model = None
-        self.is_trained = False
-        self.stop_flag = False
-        self.training_history = {}
-        self.importance = {}
-        self.parity_row = None
-        self._log(f"Tree ML trainer [{symbol} {timeframe}] initialized")
-
-    def _log(self, message):
-        self.log_callback(message)
-
-    def stop_training(self):
-        self.stop_flag = True
-        self._log("Training stop requested")
-
-    def train_single_timeframe(
-        self,
-        data,
-        feature_cols,
-        iterations,
-        learning_rate,
-        max_depth,
-        horizon,
-        status_callback,
-    ):
-        self.stop_flag = False
-        self.is_trained = False
-        tag = f"{self.symbol} {self.timeframe}"
-
-        if self.timeframe not in Config.TIMEFRAME_HYPERPARAMS:
-            raise ValueError(f"Unsupported timeframe: {self.timeframe}")
-
-        if horizon < 1:
-            raise ValueError("Prediction horizon must be at least 1 bar")
-
-        if not feature_cols:
-            raise ValueError("No training features were supplied")
-
-        if len(data) <= horizon + 1:
-            raise ValueError("Insufficient rows for training and validation")
-
-        hp = Config.TIMEFRAME_HYPERPARAMS[self.timeframe]
-        n_estimators = iterations or hp["iterations"]
-        depth = max_depth or hp["max_depth"]
-        reg_lambda = self.REG_LAMBDA if iterations else hp["reg_lambda"]
-
-        if n_estimators < 1 or depth < 1 or learning_rate <= 0:
-            raise ValueError("Invalid XGBoost training parameters")
-
-        self.parity_row = data.iloc[-1][["time"] + feature_cols].copy()
-
-        n_val = max(1, int(len(data) * Config.VALIDATION_FRACTION))
-        train_end = len(data) - n_val - horizon
-
-        if train_end < 2 or n_val < 1:
-            raise ValueError(
-                f"Insufficient rows after validation split: "
-                f"total={len(data)}, validation={n_val}, embargo={horizon}"
-            )
-
-        train_df = data.iloc[:train_end]
-        val_df = data.iloc[len(data) - n_val:]
-
-        X_train = train_df[feature_cols].to_numpy(dtype=np.float32)
-        y_train = (
-            train_df["target"] / train_df["close"] - 1.0
-        ).to_numpy(dtype=np.float32)
-
-        X_val = val_df[feature_cols].to_numpy(dtype=np.float32)
-        y_val = (
-            val_df["target"] / val_df["close"] - 1.0
-        ).to_numpy(dtype=np.float32)
-
-        if not np.isfinite(X_train).all() or not np.isfinite(y_train).all():
-            raise ValueError("Training data contains NaN or infinite values")
-
-        if not np.isfinite(X_val).all() or not np.isfinite(y_val).all():
-            raise ValueError("Validation data contains NaN or infinite values")
-
-        del train_df, val_df
-
-        self._log(
-            f"[{tag}] Train rows: {len(y_train):,}, "
-            f"Val rows: {len(y_val):,}, Embargo: {horizon} bars"
-        )
-        self._log(
-            f"[{tag}] Model features ({len(feature_cols)}): "
-            f"{', '.join(feature_cols)}"
-        )
-        self._log(
-            f"[{tag}] Trees: {n_estimators}, depth: {depth}, "
-            f"lr: {learning_rate}, L2: {reg_lambda}"
-        )
-
+    def _fit_xgboost(self, X_train, y_train, X_val, y_val, n_estimators, depth, learning_rate, reg_lambda, tag, status_callback):
         trainer = self
 
         class Progress(xgboost.callback.TrainingCallback):
@@ -1112,18 +582,14 @@ class StreamingXGBoostTrainer:
                 if (epoch + 1) % trainer.LOG_EVERY_ROUNDS == 0:
                     train_rmse = evals_log["validation_0"]["rmse"][-1]
                     val_rmse = evals_log["validation_1"]["rmse"][-1]
-                    status_callback(
-                        f"[{tag}] Round {epoch + 1}/{n_estimators}  "
-                        f"train={train_rmse:.6g}  val={val_rmse:.6g}"
-                    )
-
+                    status_callback(f"[{tag}] Round {epoch + 1}/{n_estimators}  train={train_rmse:.6g}  val={val_rmse:.6g}")
                 return trainer.stop_flag
 
         self.model = xgboost.XGBRegressor(
             n_estimators=n_estimators,
             learning_rate=learning_rate,
             max_depth=depth,
-            min_child_weight=self.MIN_CHILD_WEIGHT,
+            min_child_weight=self.XGB_MIN_CHILD_WEIGHT,
             subsample=self.SUBSAMPLE,
             colsample_bytree=self.COLSAMPLE_BYTREE,
             reg_lambda=reg_lambda,
@@ -1134,232 +600,13 @@ class StreamingXGBoostTrainer:
             random_state=self.RANDOM_STATE,
             verbosity=0,
         )
-
         self.model.fit(
-            X_train,
-            y_train,
+            X_train, y_train,
             eval_set=[(X_train, y_train), (X_val, y_val)],
             verbose=False,
         )
 
-        if self.stop_flag:
-            self._log(f"[{tag}] Training stopped")
-            return False
-
-        self.is_trained = True
-
-        gain = self.model.feature_importances_.astype(np.float64)
-        gain_total = gain.sum()
-
-        if gain_total > 0:
-            gain = 100 * gain / gain_total
-
-        self.importance = dict(
-            zip(feature_cols, gain.round(4).tolist())
-        )
-
-        predicted = self.model.predict(X_val)
-        valid_mask = y_val != 0
-
-        directional_accuracy = (
-            float(
-                (
-                    np.sign(predicted[valid_mask])
-                    == np.sign(y_val[valid_mask])
-                ).mean()
-            )
-            if valid_mask.any()
-            else 0.0
-        )
-
-        self.training_history = {
-            "symbol": self.symbol,
-            "timeframe": self.timeframe,
-            "best_rounds": int(self.model.best_iteration) + 1,
-            "rounds_run": int(
-                self.model.get_booster().num_boosted_rounds()
-            ),
-            "val_l2": float(np.mean((predicted - y_val) ** 2)),
-            "directional_accuracy": directional_accuracy,
-        }
-
-        top = sorted(
-            self.importance.items(),
-            key=lambda item: -item[1],
-        )[:self.TOP_IMPORTANCE]
-
-        self._log(
-            f"[{tag}] Top gain %: "
-            + ", ".join(f"{key}={value:.1f}" for key, value in top)
-        )
-        self._log(
-            f"[{tag}] Zero-importance features: "
-            f"{sum(1 for value in self.importance.values() if value == 0)}"
-        )
-        self._log(
-            f"[{tag}] Directional accuracy: "
-            f"{directional_accuracy * 100:.1f}%"
-        )
-
-        return self.is_trained
-
-    def save_model(
-        self,
-        model_dir,
-        filename_stem,
-        feature_cols,
-        horizon,
-        export_onnx,
-    ):
-        if not self.is_trained or self.model is None:
-            raise RuntimeError("Cannot save an untrained XGBoost model")
-
-        if not self.training_history:
-            raise RuntimeError("Training history is missing")
-
-        best_rounds = self.training_history["best_rounds"]
-
-        if best_rounds < 1:
-            raise RuntimeError("XGBoost best iteration is invalid")
-
-        output_dir = pathlib.Path(model_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        model_path = output_dir / f"{filename_stem}{self.MODEL_EXT}"
-        onnx_path = output_dir / f"{filename_stem}{self.ONNX_EXT}"
-        pkl_path = output_dir / f"{filename_stem}.pkl"
-
-        best_booster = self.model.get_booster()[:best_rounds]
-        best_booster.save_model(str(model_path))
-
-        onnx_input = None
-        onnx_output = None
-
-        if export_onnx:
-            onnx_model = onnxmltools.convert_xgboost(
-                best_booster,
-                initial_types=[
-                    (
-                        "input",
-                        onnxconverter_common.data_types.FloatTensorType(
-                            [1, len(feature_cols)]
-                        ),
-                    )
-                ],
-                target_opset=self.ONNX_OPSET,
-            )
-
-            for key, value in (
-                ("features", ",".join(feature_cols)),
-                ("feature_version", str(Config.FEATURE_VERSION)),
-                ("best_rounds", str(best_rounds)),
-            ):
-                entry = onnx_model.metadata_props.add()
-                entry.key = key
-                entry.value = value
-
-            onnx.checker.check_model(onnx_model)
-            onnx_path.write_bytes(onnx_model.SerializeToString())
-
-            onnx_input = onnx_model.graph.input[0].name
-            onnx_output = onnx_model.graph.output[0].name
-
-            del onnx_model
-
-        artifact = {
-            "model_type": "xgboost.XGBRegressor",
-            "target_type": "forward_return",
-            "feature_version": Config.FEATURE_VERSION,
-            "symbol": self.symbol,
-            "timeframe": self.timeframe,
-            "horizon": horizon,
-            "warmup_bars": Config.WARMUP_BARS,
-            "feature_columns": list(feature_cols),
-            "feature_importance": self.importance,
-            "model_path": str(model_path),
-            "onnx_path": str(onnx_path) if export_onnx else None,
-            "training_history": self.training_history,
-            "training_time": datetime.datetime.now().isoformat(),
-            "best_rounds": best_rounds,
-            "dtype": "float32",
-            "fill": "inf_to_nan,ffill,zero",
-            "target": "close[t+horizon]/close[t]-1",
-            "time": "bar_open_csv_timezone",
-            "onnx_input": onnx_input,
-            "onnx_output": onnx_output,
-            "parity_timestamp": self.parity_row["time"].value // 10**9,
-            "parity_features": {
-                column: float(self.parity_row[column])
-                for column in feature_cols
-            },
-        }
-
-        with open(pkl_path, "wb") as file:
-            pickle.dump(artifact, file, protocol=pickle.HIGHEST_PROTOCOL)
-
-        self._log(f"✅ XGBoost model saved: {model_path}")
-
-        if export_onnx:
-            self._log(f"✅ ONNX model saved: {onnx_path}")
-
-        self._log(f"✅ PKL metadata saved: {pkl_path}")
-
-
-class StreamingCatBoostTrainer:
-    MODEL_PREFIX = "ai_predict_catboost"
-    MODEL_EXT = ".cbm"
-    ONNX_EXT = ".onnx"
-    META_EXT = ".meta.txt"
-    INFO_EXT = ".info.json"
-    LOG_EVERY_ROUNDS = 10
-    TOP_IMPORTANCE = 10
-    EARLY_STOPPING_ROUNDS = 100
-    RANDOM_STATE = 42
-
-    def __init__(self, log_callback, symbol, timeframe):
-        self.log_callback = log_callback
-        self.symbol = symbol
-        self.timeframe = timeframe
-        self.model = None
-        self.is_trained = False
-        self.stop_flag = False
-        self.training_history = {}
-        self.importance = {}
-        self.parity_row = None
-        self._log(f"🚀 CatBoost trainer [{symbol} {timeframe}] initialized (CPU)")
-
-    def _log(self, message):
-        self.log_callback(message)
-
-    def stop_training(self):
-        self.stop_flag = True
-        self._log("⏹️ Training stop requested")
-
-    def train_single_timeframe(self, data, feature_cols, iterations, learning_rate, max_depth, horizon, status_callback):
-        self.stop_flag = False
-        tag = f"{self.symbol} {self.timeframe}"
-
-        hp = Config.TIMEFRAME_HYPERPARAMS[self.timeframe]
-        n_estimators = iterations or hp["iterations"]
-        depth = max_depth or hp["max_depth"]
-        reg_lambda = 3.0 if iterations else hp["reg_lambda"]
-
-        self.parity_row = data.iloc[-1][["time"] + feature_cols]
-
-        n_val = max(1, int(len(data) * Config.VALIDATION_FRACTION))
-        train_df = data.iloc[:len(data) - n_val - horizon]
-        val_df = data.iloc[len(data) - n_val:]
-
-        X_train = train_df[feature_cols].to_numpy(dtype=np.float32)
-        y_train = (train_df["target"] / train_df["close"] - 1.0).to_numpy(dtype=np.float32)
-        X_val = val_df[feature_cols].to_numpy(dtype=np.float32)
-        y_val = (val_df["target"] / val_df["close"] - 1.0).to_numpy(dtype=np.float32)
-        del train_df, val_df
-
-        self._log(f"[{tag}] Train rows: {len(y_train):,}, Val rows: {len(y_val):,}, Embargo: {horizon} bars")
-        self._log(f"[{tag}] Model features ({len(feature_cols)}): {', '.join(feature_cols)}")
-        self._log(f"[{tag}] Trees: {n_estimators}, depth: {depth}, lr: {learning_rate}, L2: {reg_lambda}")
-
+    def _fit_catboost(self, X_train, y_train, X_val, y_val, n_estimators, depth, learning_rate, reg_lambda, tag, status_callback):
         def after_iteration(info):
             if (info.iteration + 1) % self.LOG_EVERY_ROUNDS == 0:
                 status_callback(f"[{tag}] Round {info.iteration + 1}/{n_estimators}  train={info.metrics['learn']['RMSE'][-1]:.6g}  val={info.metrics['validation']['RMSE'][-1]:.6g}")
@@ -1383,27 +630,229 @@ class StreamingCatBoostTrainer:
             eval_set=(X_val, y_val),
             callbacks=[types.SimpleNamespace(after_iteration=after_iteration)],
         )
+
+    def _summary(self):
+        if self.backend == "LightGBM":
+            return (
+                self.model.booster_.feature_importance(importance_type="gain"),
+                int(self.model.best_iteration_),
+                int(self.model.booster_.current_iteration()),
+            )
+        if self.backend == "XGBoost":
+            return (
+                self.model.feature_importances_,
+                int(self.model.best_iteration) + 1,
+                int(self.model.get_booster().num_boosted_rounds()),
+            )
+        return (
+            self.model.get_feature_importance(),
+            int(self.model.tree_count_),
+            len(self.model.get_evals_result()["validation"]["RMSE"]),
+        )
+
+    def train_single_timeframe(
+        self,
+        data,
+        feature_cols,
+        iterations,
+        learning_rate,
+        max_depth,
+        horizon,
+        status_callback,):
+        self.stop_flag = False
+        self.is_trained = False
+
+        tag = f"{self.symbol} {self.timeframe}"
+
+        expected_features = list(Config.FEATURE_COLUMNS)
+
+        if feature_cols != expected_features:
+            raise ValueError(
+                f"[{tag}] Training requires exactly OHLCV features "
+                f"in this order: {expected_features}"
+            )
+
+        hp = Config.TIMEFRAME_HYPERPARAMS[self.timeframe]
+
+        n_estimators = iterations or hp["iterations"]
+        depth = max_depth or hp["max_depth"]
+
+        reg_lambda = (
+            self.BACKENDS[self.backend]["reg_lambda"]
+            if iterations
+            else hp["reg_lambda"]
+        )
+
+        self.parity_row = data.iloc[-1][
+            ["time"] + feature_cols
+        ]
+
+        n_val = max(
+            1,
+            int(len(data) * Config.VALIDATION_FRACTION),
+        )
+
+        train_df = data.iloc[
+            :len(data) - n_val - horizon
+        ]
+
+        val_df = data.iloc[
+            len(data) - n_val:
+        ]
+
+        X_train = train_df[feature_cols].to_numpy(
+            dtype=np.float32
+        )
+
+        y_train = (
+            train_df["target"] / train_df["close"] - 1.0
+        ).to_numpy(dtype=np.float32)
+
+        X_val = val_df[feature_cols].to_numpy(
+            dtype=np.float32
+        )
+
+        y_val = (
+            val_df["target"] / val_df["close"] - 1.0
+        ).to_numpy(dtype=np.float32)
+
+        del train_df, val_df
+
+        if len(y_train) == 0 or len(y_val) == 0:
+            raise ValueError(
+                f"[{tag}] Insufficient training or validation rows"
+            )
+
+        if (
+            not np.isfinite(X_train).all()
+            or not np.isfinite(X_val).all()
+            or not np.isfinite(y_train).all()
+            or not np.isfinite(y_val).all()
+        ):
+            raise ValueError(
+                f"[{tag}] Non-finite training or validation values"
+            )
+
+        self._log(
+            f"[{tag}] Train rows: {len(y_train):,}, "
+            f"Val rows: {len(y_val):,}, Embargo: {horizon} bars"
+        )
+
+        self._log(
+            f"[{tag}] Model features ({len(feature_cols)}): "
+            f"{', '.join(feature_cols)}"
+        )
+
+        self._log(
+            f"[{tag}] Trees: {n_estimators}, depth: {depth}, "
+            f"lr: {learning_rate}, L2: {reg_lambda}"
+        )
+
+        getattr(
+            self,
+            f"_fit_{self.backend.lower()}",
+        )(
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            n_estimators,
+            depth,
+            learning_rate,
+            reg_lambda,
+            tag,
+            status_callback,
+        )
+
+        if self.stop_flag:
+            self._log(f"[{tag}] Training stopped")
+            return False
+
         self.is_trained = True
 
-        gain = np.asarray(self.model.get_feature_importance(), dtype=np.float64)
+        gain, best_rounds, rounds_run = self._summary()
+
+        gain = np.asarray(gain, dtype=np.float64)
         gain = 100 * gain / max(gain.sum(), 1e-12)
-        self.importance = dict(zip(feature_cols, gain.round(4).tolist()))
+
+        self.importance = dict(
+            zip(
+                feature_cols,
+                gain.round(4).tolist(),
+            )
+        )
 
         predicted = self.model.predict(X_val)
+
         valid_mask = y_val != 0
-        self.training_history.update({
+
+        self.training_history = {
             "symbol": self.symbol,
             "timeframe": self.timeframe,
-            "best_rounds": int(self.model.tree_count_),
-            "rounds_run": len(self.model.get_evals_result()["validation"]["RMSE"]),
-            "val_l2": float(np.mean((predicted - y_val) ** 2)),
-            "directional_accuracy": float((np.sign(predicted[valid_mask]) == np.sign(y_val[valid_mask])).mean()),
-        })
-        top = sorted(self.importance.items(), key=lambda item: -item[1])[:self.TOP_IMPORTANCE]
-        self._log(f"[{tag}] Top importance %: " + ", ".join(f"{k}={v:.1f}" for k, v in top))
-        self._log(f"[{tag}] Zero-importance features: {sum(1 for v in self.importance.values() if v == 0)}")
-        self._log(f"[{tag}] Directional accuracy: {self.training_history['directional_accuracy'] * 100:.1f}%")
+            "best_rounds": best_rounds,
+            "rounds_run": rounds_run,
+            "val_l2": float(
+                np.mean((predicted - y_val) ** 2)
+            ),
+            "directional_accuracy": float(
+                (
+                    np.sign(predicted[valid_mask])
+                    == np.sign(y_val[valid_mask])
+                ).mean()
+            ),
+        }
+
+        top = sorted(
+            self.importance.items(),
+            key=lambda item: -item[1],
+        )[:self.TOP_IMPORTANCE]
+
+        self._log(
+            f"[{tag}] Top importance %: "
+            + ", ".join(
+                f"{key}={value:.1f}"
+                for key, value in top
+            )
+        )
+
+        self._log(
+            f"[{tag}] Zero-importance features: "
+            f"{sum(1 for value in self.importance.values() if value == 0)}"
+        )
+
+        self._log(
+            f"[{tag}] Directional accuracy: "
+            f"{self.training_history['directional_accuracy'] * 100:.1f}%"
+        )
+
         return self.is_trained
+
+    def _save_native(self, model_path):
+        if self.backend == "LightGBM":
+            self.model.booster_.save_model(str(model_path))
+        elif self.backend == "XGBoost":
+            self.model.get_booster()[:self.training_history["best_rounds"]].save_model(str(model_path))
+        else:
+            self.model.save_model(str(model_path))
+
+    def _onnx_model(self, feature_cols, onnx_path):
+        initial_types = [
+            ("input", onnxconverter_common.data_types.FloatTensorType([1, len(feature_cols)]))
+        ]
+        if self.backend == "LightGBM":
+            return onnxmltools.convert_lightgbm(
+                self.model,
+                initial_types=initial_types,
+                target_opset=self.ONNX_OPSET,
+            )
+        if self.backend == "XGBoost":
+            return onnxmltools.convert_xgboost(
+                self.model.get_booster()[:self.training_history["best_rounds"]],
+                initial_types=initial_types,
+                target_opset=self.ONNX_OPSET,
+            )
+        self.model.save_model(str(onnx_path), format="onnx")
+        return onnx.load(str(onnx_path))
 
     def save_model(self, model_dir, filename_stem, feature_cols, horizon, export_onnx):
         output_dir = pathlib.Path(model_dir)
@@ -1411,26 +860,27 @@ class StreamingCatBoostTrainer:
 
         model_path = output_dir / f"{filename_stem}{self.MODEL_EXT}"
         onnx_path = output_dir / f"{filename_stem}{self.ONNX_EXT}"
-        pkl_path = output_dir / f"{filename_stem}.pkl"
+        json_path = output_dir / f"{filename_stem}{self.INFO_EXT}"
+        json_temp = output_dir / f".{filename_stem}.tmp{self.INFO_EXT}"
 
-        self.model.save_model(str(model_path))
+        self._save_native(model_path)
 
         onnx_input = None
         onnx_output = None
 
         if export_onnx:
-            self.model.save_model(str(onnx_path), format="onnx")
-            onnx_model = onnx.load(str(onnx_path))
+            onnx_model = self._onnx_model(feature_cols, onnx_path)
 
             for key, value in (
                 ("features", ",".join(feature_cols)),
-                ("feature_version", str(Config.FEATURE_VERSION)),
+                ("best_rounds", str(self.training_history["best_rounds"])),
             ):
                 entry = onnx_model.metadata_props.add()
                 entry.key = key
                 entry.value = value
 
-            onnx.save(onnx_model, str(onnx_path))
+            onnx.checker.check_model(onnx_model)
+            onnx_path.write_bytes(onnx_model.SerializeToString())
 
             onnx_input = onnx_model.graph.input[0].name
             onnx_output = onnx_model.graph.output[0].name
@@ -1438,19 +888,20 @@ class StreamingCatBoostTrainer:
             del onnx_model
 
         artifact = {
-            "model_type": "catboost.CatBoostRegressor",
+            "model_type": self.BACKENDS[self.backend]["model_type"],
             "target_type": "forward_return",
-            "feature_version": Config.FEATURE_VERSION,
             "symbol": self.symbol,
             "timeframe": self.timeframe,
             "horizon": horizon,
             "warmup_bars": Config.WARMUP_BARS,
             "feature_columns": list(feature_cols),
             "feature_importance": self.importance,
-            "model_path": str(model_path),
-            "onnx_path": str(onnx_path) if export_onnx else None,
+            "model_file": model_path.name,
+            "onnx_file": onnx_path.name if export_onnx else None,
+            "info_file": json_path.name,
             "training_history": self.training_history,
             "training_time": datetime.datetime.now().isoformat(),
+            "best_rounds": self.training_history["best_rounds"],
             "dtype": "float32",
             "fill": "inf_to_nan,ffill,zero",
             "target": "close[t+horizon]/close[t]-1",
@@ -1464,19 +915,20 @@ class StreamingCatBoostTrainer:
             },
         }
 
-        with open(pkl_path, "wb") as file:
-            pickle.dump(artifact, file, protocol=pickle.HIGHEST_PROTOCOL)
+        json_temp.write_text(json.dumps(artifact, indent=2, allow_nan=False))
+        os.replace(json_temp, json_path)
 
-        self._log(f"✅ CatBoost model saved: {model_path}")
+        self._log(f"✅ {self.backend} model saved: {model_path}")
 
         if export_onnx:
             self._log(f"✅ ONNX model saved: {onnx_path}")
 
-        self._log(f"✅ PKL metadata saved: {pkl_path}")
+        self._log(f"✅ JSON metadata saved: {json_path}")
 
 
 class PredictTreeTrainerGUI(ctk.CTk):
     INI_PATH = pathlib.Path(__file__).with_suffix(".ini")
+    POLL_MS = 50
 
     WINDOW_W = 640
     WINDOW_H = 1020
@@ -1489,6 +941,8 @@ class PredictTreeTrainerGUI(ctk.CTk):
     TITLE_COLOR = "yellow"
     FONT_TEXT = ("TkDefaultFont", 12)
     FONT_TITLE = ("TkDefaultFont", 14, "bold")
+    FONT_LICENSE = ("TkDefaultFont", 14)
+    FONT_NAME = ("TkDefaultFont", 16, "bold")
     FONT_LOG = ("Courier", 12)
     TRAIN_COLOR = "#2e7d32"
     TRAIN_HOVER = "#1b5e20"
@@ -1502,9 +956,8 @@ class PredictTreeTrainerGUI(ctk.CTk):
     STATUS_H = 60
 
     TRAINERS = {
-        "LightGBM": StreamingLightGBMTrainer,
-        "XGBoost": StreamingXGBoostTrainer,
-        "CatBoost": StreamingCatBoostTrainer,
+        name: functools.partial(StreamingTreeTrainer, backend=name)
+        for name in StreamingTreeTrainer.BACKENDS
     }
 
     def __init__(self):
@@ -1534,7 +987,7 @@ class PredictTreeTrainerGUI(ctk.CTk):
         self._create_ui()
         self._load_state()
         self.gui_logger.set_log_widget(self.log_text)
-        self.after(50, self._process_worker_events)
+        self.after(self.POLL_MS, self._process_worker_events)
         self.after(500, self.scan_data_source)
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
 
@@ -1548,7 +1001,10 @@ class PredictTreeTrainerGUI(ctk.CTk):
             event, value = self.worker_events.get_nowait()
 
             if event == "status":
-                self.status_label.configure(text=value)
+                self.status_text.configure(state="normal")
+                self.status_text.delete("1.0", "end")
+                self.status_text.insert("1.0", value)
+                self.status_text.configure(state="disabled")
 
             elif event == "finished":
                 self._set_training(False)
@@ -1559,7 +1015,7 @@ class PredictTreeTrainerGUI(ctk.CTk):
                     self.destroy()
                     return
 
-        self.after(50, self._process_worker_events)
+        self.after(self.POLL_MS, self._process_worker_events)
 
     def report_callback_exception(self, exc_type, exc_value, exc_traceback):
         traceback.print_exception(exc_type, exc_value, exc_traceback)
@@ -1616,21 +1072,16 @@ class PredictTreeTrainerGUI(ctk.CTk):
         main = ctk.CTkFrame(self, fg_color=self.BG, corner_radius=0, border_width=0)
         main.pack(fill="both", expand=True, padx=self.PAD, pady=self.PAD)
 
-        title_frame = ctk.CTkFrame(main, corner_radius=6)
-        title_frame.pack(fill="x", pady=(0, 4))
+        frame = self._section(main)
+        ctk.CTkLabel(frame, text="Copyright Su Nie | BSD-3C License | https://github.com/can87683",
+            font=self.FONT_LICENSE,
+            text_color=self.TITLE_COLOR).pack(fill="x",
+            padx=self.PAD, pady=self.PAD)
 
-        ctk.CTkLabel(
-            title_frame,
-            text="Copyright Su Nie | BSD-3C License | https://github.com/can87683",
-            font=("TkDefaultFont", 14),
-            text_color="yellow",
-        ).pack(pady=(0, 2))
-
-        ctk.CTkLabel(
-            title_frame,
-            text="Tree ML Trainer",
-            font=("TkDefaultFont", 16, "bold"),
-        ).pack(pady=4)
+        ctk.CTkLabel(frame, text="Tree ML Trainer",
+            font=self.FONT_NAME,
+            text_color=self.TEXT_COLOR).pack(fill="x",
+            padx=self.PAD, pady=self.PAD)
 
         self.usage_row = UsageRow(main)
 
@@ -1674,7 +1125,7 @@ class PredictTreeTrainerGUI(ctk.CTk):
             row.grid_columnconfigure(i, weight=1)
             self._check(row, tf, self.tf_vars[tf], self.TF_CHECK_W).grid(row=0, column=i, padx=self.PAD, pady=self.PAD, sticky="ew")
 
-        names = FeatureEngineer.feature_names()
+        names = list(Config.FEATURE_COLUMNS)
         frame = self._section(main, f"Training Features ({len(names)})")
         self._label(frame, ", ".join(names), anchor="w", justify="left", wraplength=self.WRAP_W).pack(fill="x", padx=self.PAD, pady=self.PAD)
 
@@ -1698,7 +1149,7 @@ class PredictTreeTrainerGUI(ctk.CTk):
         self.status_text.configure(state="disabled")
 
         frame = self._section(main, "Log", expand=True)
-        self.log_text = self._textbox(frame, scrollbar=True)
+        self.log_text = self._textbox(frame)
         self.log_text.pack(fill="both", expand=True, padx=self.PAD, pady=self.PAD)
         self.copy_menu = tk.Menu(self, tearoff=0, bg=self.ENTRY_BG, fg=self.TEXT_COLOR, font=self.FONT_TEXT)
         self.copy_menu.add_command(label="Copy selected", command=self._copy_selected)
@@ -1730,12 +1181,7 @@ class PredictTreeTrainerGUI(ctk.CTk):
         cp = configparser.ConfigParser()
         cp.read(str(self.INI_PATH))
 
-        if cp.has_option("window", "geometry"):
-            self.geometry(cp.get("window", "geometry"))
-        else:
-            x = cp.getint("window", "x")
-            y = cp.getint("window", "y")
-            self.geometry(f"{self.WINDOW_W}x{self.WINDOW_H}+{x}+{y}")
+        self.geometry(cp.get("window", "geometry"))
 
         self.csv_path_var.set(cp["paths"]["csv_folder"])
         self.model_path_var.set(cp["paths"]["model_folder"])
@@ -1885,7 +1331,7 @@ class PredictTreeTrainerGUI(ctk.CTk):
                 f"🤖 Backends: {', '.join(selected_backends)}"
             )
 
-            feature_names = FeatureEngineer.feature_names()
+            feature_names = list(Config.FEATURE_COLUMNS)
 
             self.gui_logger.log(
                 f"📊 Training features ({len(feature_names)}): "

@@ -71,7 +71,7 @@ class Config:
 
     MODEL_PREFIX = "ai_predict_tft"
     MODEL_EXT = ".ckpt"
-    METADATA_EXT = ".pkl"
+    METADATA_EXT = ".json"
     ONNX_EXT = ".onnx"
     ONNX_OPSET = 14
 
@@ -145,28 +145,30 @@ class GPUManager:
 
 class UsageRow:
     FRAME_HEIGHT = 40
-    FRAME_CORNER_RADIUS = 5
-    FRAME_PADY = (0, 10)
+    FRAME_CORNER_RADIUS = 2
+    FRAME_BG = "#1c1c1c"
+    FRAME_PADY = 2
 
-    FONT = ("Ubuntu Mono", 20)
+    FONT = ("TkDefaultFont", 20)
     TEXT_COLOR = "Lime"
     PLACEHOLDER_TEXT = "Loading system usage..."
 
-    LABEL_PADX = 10
-    LABEL_PADY = 5
+    LABEL_PADX = 2
+    LABEL_PADY = 2
 
     REFRESH_MS = 2000
-    CPU_SAMPLE_INTERVAL = 0.5
 
     def __init__(self, parent):
-        self.usage_frame = CTkFrame(
+        self.usage_frame = ctk.CTkFrame(
             parent,
             height=self.FRAME_HEIGHT,
             corner_radius=self.FRAME_CORNER_RADIUS,
+            fg_color=self.FRAME_BG,
         )
         self.usage_frame.pack(fill="x", pady=self.FRAME_PADY)
+        self.usage_frame.pack_propagate(False)
 
-        self.usage_label = CTkLabel(
+        self.usage_label = ctk.CTkLabel(
             self.usage_frame,
             text=self.PLACEHOLDER_TEXT,
             font=self.FONT,
@@ -179,17 +181,13 @@ class UsageRow:
         self._update_usage()
 
     def _update_usage(self):
-        cpu = psutil.cpu_percent(interval=self.CPU_SAMPLE_INTERVAL)
+        cpu = psutil.cpu_percent(interval=None)
         dram = psutil.virtual_memory().percent
         gpu_percent = vram_percent = 0
-        try:
-            import GPUtil
-            gpus = GPUtil.getGPUs()
-            if gpus:
-                gpu_percent = gpus[0].load * 100
-                vram_percent = gpus[0].memoryUtil * 100
-        except ImportError:
-            pass
+        gpus = GPUtil.getGPUs()
+        if gpus:
+            gpu_percent = gpus[0].load * 100
+            vram_percent = gpus[0].memoryUtil * 100
         self.usage_label.configure(
             text=f"CPU: {cpu:.1f}%  DRAM: {dram:.1f}%  "
                  f"GPU: {gpu_percent:.1f}%  VRAM: {vram_percent:.1f}%"
@@ -1509,6 +1507,7 @@ class TFTTrainerGUI(CTk):
         ).pack(pady=4)
 
         UsageRow(main_frame)
+
         self._create_csv_section(main_frame)
         self._create_model_folder_section(main_frame)
         self._create_parameters_section(main_frame)
