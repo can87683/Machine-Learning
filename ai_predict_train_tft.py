@@ -20,10 +20,13 @@ import pandas as pd
 import pickle
 import gc
 import psutil
+import GPUtil
 import queue
 import shutil
 from datetime import datetime
 import torch
+import logging
+import warnings
 
 multiprocessing.set_start_method('spawn', force=True)
 
@@ -35,13 +38,13 @@ from pytorch_forecasting.data.encoders import GroupNormalizer
 
 class Config:
     HOME = Path.home()
-    MODEL_DIR = HOME / "ai_model_ml_symbol"
+    MODEL_DIR = HOME / "ai_model_ml_tft"
     DATASET_DIR = HOME / "mt5_data"
 
     MAX_ROWS_PER_SYMBOL = 5000
     MAX_DATASET_ROWS = 10000
 
-    DEFAULT_FEATURES = ['time', 'open', 'high', 'low', 'close', 'tick_volume']
+    DEFAULT_FEATURES = ['open', 'high', 'low', 'close', 'tick_volume']
 
     DEFAULT_LOOKBACK = 60
     DEFAULT_HORIZON = 10
@@ -201,14 +204,128 @@ class ConsoleLogger:
         self.original_stream = original_stream
 
     def write(self, message):
-        if message and message.strip():
-            self.original_stream.write(message)
-            self.original_stream.flush()
-            if self.gui_logger:
-                self.gui_logger.log(message.strip(), "console")
+        if message.strip():
+            self.gui_logger.log(message.strip(), "console")
 
     def flush(self):
         self.original_stream.flush()
+
+
+class GUILogger(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.messages = queue.Queue()
+        self.log_widget = None
+        self.ready = False
+        self.context_menu = None
+        self._original_stdout = sys.stdout
+        self._original_stderr = sys.stderr
+
+    def emit(self, record):
+        self.messages.put((self.format(record), "info"))
+
+    def set_log_widget(self, widget):
+        self.log_widget = widget
+        self.ready = True
+
+        self.log_widget.configure(
+            font=("Ubuntu Mono", 12),
+            text_color="white"
+        )
+
+        self.context_menu = tk.Menu(
+            self.log_widget,
+            tearoff=0,
+            bg="#1c1c1c",
+            fg="white",
+            activebackground="#404040",
+            activeforeground="white",
+            font=("Ubuntu Mono", 10)
+        )
+
+        self.context_menu.add_command(
+            label="Copy All",
+            command=self.copy_all
+        )
+
+        self.context_menu.add_command(
+            label="Copy Selected",
+            command=self.copy_selected
+        )
+
+        self.context_menu.add_separator()
+
+        self.context_menu.add_command(
+            label="Clear All",
+            command=self.clear_all
+        )
+
+        self.log_widget._textbox.bind(
+            "<Button-3>",
+            self._show_context_menu
+        )
+
+        self._drain_queue()
+
+    def _show_context_menu(self, event):
+        self.context_menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    def copy_all(self):
+        content = self.log_widget._textbox.get("1.0", "end-1c")
+
+        self.log_widget._textbox.clipboard_clear()
+        self.log_widget._textbox.clipboard_append(content)
+
+    def copy_selected(self):
+        selected = self.log_widget._textbox.tag_ranges("sel")
+
+        if selected:
+            content = self.log_widget._textbox.get(
+                "sel.first",
+                "sel.last"
+            )
+
+            self.log_widget._textbox.clipboard_clear()
+            self.log_widget._textbox.clipboard_append(content)
+
+    def clear_all(self):
+        self.log_widget._textbox.delete("1.0", "end")
+
+    def _write_to_widget(self, message, level):
+        log_entry = (
+            f"[{datetime.now().strftime('%H:%M:%S')}] "
+            f"{message}\n"
+        )
+
+        self.log_widget.insert("end", log_entry)
+        self.log_widget.see("end")
+
+    def _drain_queue(self):
+        while not self.messages.empty():
+            message, level = self.messages.get_nowait()
+            self._write_to_widget(message, level)
+
+        self.log_widget.after(50, self._drain_queue)
+
+    def log(self, message, level="info"):
+        self.messages.put((message, level))
+
+    def enable_console_redirect(self):
+        sys.stdout = ConsoleLogger(self, self._original_stdout)
+        sys.stderr = ConsoleLogger(self, self._original_stderr)
+
+        warnings.filterwarnings("ignore", module=r"lightning(\.|$)")
+
+        lightning_logger = logging.getLogger("lightning.pytorch")
+        lightning_logger.handlers.clear()
+        lightning_logger.addHandler(self)
+        lightning_logger.propagate = False
+
+    def disable_console_redirect(self):
+        sys.stdout = self._original_stdout
+        sys.stderr = self._original_stderr
+        logging.getLogger("lightning.pytorch").removeHandler(self)
 
 
 class MemoryOptimizer:
@@ -396,142 +513,30 @@ class FeatureEngineer:
         return df
 
 
-class GUILogger:
-    def __init__(self):
-        self.messages = queue.Queue()
-        self.log_widget = None
-        self.ready = False
-        self.context_menu = None
-        self._original_stdout = sys.stdout
-        self._original_stderr = sys.stderr
-
-    def set_log_widget(self, widget):
-        self.log_widget = widget
-        self.ready = True
-
-        self.log_widget.configure(
-            font=("Ubuntu Mono", 12),
-            text_color="white"
-        )
-
-        self.context_menu = tk.Menu(
-            self.log_widget,
-            tearoff=0,
-            bg="#1c1c1c",
-            fg="white",
-            activebackground="#404040",
-            activeforeground="white",
-            font=("Ubuntu Mono", 10)
-        )
-
-        self.context_menu.add_command(
-            label="Copy All",
-            command=self.copy_all
-        )
-
-        self.context_menu.add_command(
-            label="Copy Selected",
-            command=self.copy_selected
-        )
-
-        self.context_menu.add_separator()
-
-        self.context_menu.add_command(
-            label="Clear All",
-            command=self.clear_all
-        )
-
-        self.log_widget._textbox.bind(
-            "<Button-3>",
-            self._show_context_menu
-        )
-
-        self._drain_queue()
-
-    def _show_context_menu(self, event):
-        self.context_menu.tk_popup(event.x_root, event.y_root)
-        return "break"
-
-    def copy_all(self):
-        content = self.log_widget._textbox.get("1.0", "end-1c")
-
-        self.log_widget._textbox.clipboard_clear()
-        self.log_widget._textbox.clipboard_append(content)
-
-    def copy_selected(self):
-        selected = self.log_widget._textbox.tag_ranges("sel")
-
-        if selected:
-            content = self.log_widget._textbox.get(
-                "sel.first",
-                "sel.last"
-            )
-
-            self.log_widget._textbox.clipboard_clear()
-            self.log_widget._textbox.clipboard_append(content)
-
-    def clear_all(self):
-        self.log_widget._textbox.delete("1.0", "end")
-
-    def _write_to_widget(self, message, level):
-        log_entry = (
-            f"[{datetime.now().strftime('%H:%M:%S')}] "
-            f"{message}\n"
-        )
-
-        self.log_widget.insert("end", log_entry)
-        self.log_widget.see("end")
-
-    def _drain_queue(self):
-        while not self.messages.empty():
-            message, level = self.messages.get_nowait()
-            self._write_to_widget(message, level)
-
-        self.log_widget.after(50, self._drain_queue)
-
-    def log(self, message, level="info"):
-        console_entry = (
-            f"[{datetime.now().strftime('%H:%M:%S')}] "
-            f"[{level.upper()}] {message}"
-        )
-
-        self._original_stdout.write(console_entry + "\n")
-        self._original_stdout.flush()
-
-        self.messages.put((message, level))
-
-    def enable_console_redirect(self):
-        sys.stdout = ConsoleLogger(self, self._original_stdout)
-        sys.stderr = ConsoleLogger(self, self._original_stderr)
-
-    def disable_console_redirect(self):
-        sys.stdout = self._original_stdout
-        sys.stderr = self._original_stderr
-
-
 class StreamingDataPreparer:
+
     def __init__(self, log_callback=None):
         self.log_callback = log_callback or print
         self.feature_cols = []
         self.target_column = "target"
 
-        self.enable_atr = True
-        self.enable_bollinger = True
-        self.enable_cci = True
-        self.enable_cmf = True
-        self.enable_donchian = True
-        self.enable_ema = True
-        self.enable_force_index = True
-        self.enable_macd = True
-        self.enable_mfi = True
-        self.enable_obv = True
-        self.enable_price_structure = True
-        self.enable_realized_vol = True
-        self.enable_roc = True
-        self.enable_rsi = True
-        self.enable_rvwap = True
-        self.enable_stochastic = True
-        self.enable_volume_metrics = True
+        self.enable_atr = False
+        self.enable_bollinger = False
+        self.enable_cci = False
+        self.enable_cmf = False
+        self.enable_donchian = False
+        self.enable_ema = False
+        self.enable_force_index = False
+        self.enable_macd = False
+        self.enable_mfi = False
+        self.enable_obv = False
+        self.enable_price_structure = False
+        self.enable_realized_vol = False
+        self.enable_roc = False
+        self.enable_rsi = False
+        self.enable_rvwap = False
+        self.enable_stochastic = False
+        self.enable_volume_metrics = False
 
     def _log(self, message):
         if self.log_callback:
@@ -586,13 +591,7 @@ class StreamingDataPreparer:
 
         df = FeatureEngineer.add_time_features(df)
 
-        engineered_features = [
-            "hour_sin", "hour_cos", "day_sin", "day_cos", "month_sin", "month_cos",
-            "returns_1", "returns_5", "returns_10"
-        ]
-        df['returns_1'] = df['close'].pct_change()
-        df['returns_5'] = df['close'].pct_change(periods=5)
-        df['returns_10'] = df['close'].pct_change(periods=10)
+        engineered_features = []
 
         if self.enable_atr:
             df = FeatureEngineer._add_atr(df)
@@ -746,6 +745,7 @@ class StreamingTFTTrainer:
         self.checkpoint_path = None
         self.is_trained = False
         self.stop_flag = False
+        self.lightning_trainer = None
         self.model_dir = Config.MODEL_DIR
         self.gpu_manager = GPUManager(verbose=False)
         self.device = self.gpu_manager.get_device("pytorch")
@@ -787,9 +787,7 @@ class StreamingTFTTrainer:
         batch_size=512,
         lookback=60,
         horizon=10,
-        **kwargs
-    ):
-        self.stop_flag = False
+        **kwargs):
 
         csv_folder = kwargs.get("csv_folder")
         feature_cols = kwargs.get("feature_cols")
@@ -815,6 +813,9 @@ class StreamingTFTTrainer:
             horizon,
             timeframe
         )
+
+        if self.stop_flag:
+            return False
 
         if len(data) == 0:
             raise ValueError("Empty dataframe")
@@ -953,7 +954,6 @@ class StreamingTFTTrainer:
             accelerator=accelerator,
             devices=1,
             max_epochs=epochs,
-            min_epochs=1,
             precision=precision,
             gradient_clip_val=Config.GRADIENT_CLIP_NORM,
             callbacks=[checkpoint_callback, early_stopping],
@@ -962,6 +962,11 @@ class StreamingTFTTrainer:
             enable_model_summary=False,
             num_sanity_val_steps=0,
         )
+
+        self.lightning_trainer = lightning_trainer
+
+        if self.stop_flag:
+            return False
 
         self._log(
             f"🚀 [{timeframe}] Starting TFT training "
@@ -973,6 +978,12 @@ class StreamingTFTTrainer:
             train_dataloaders=train_loader,
             val_dataloaders=val_loader
         )
+
+        self.lightning_trainer = None
+
+        if self.stop_flag:
+            self._log(f"⏹️ [{timeframe}] Training stopped")
+            return False
 
         if checkpoint_callback.best_model_score is not None:
             self.training_history["best_val_loss"] = float(
@@ -1137,8 +1148,8 @@ class StreamingTFTTrainer:
         model_dir=None,
         sequence_length=None,
         num_features=None,
-        export_onnx=True
-    ):
+        export_onnx=True):
+
         if not self.is_trained or self.model is None:
             self._log("⚠️ No trained model available")
             return False
@@ -1181,27 +1192,15 @@ class StreamingTFTTrainer:
             "onnx_path": str(onnx_path) if onnx_path else None,
             "onnx_exported": False,
             "dataset_parameters": self.dataset_parameters,
-            "feature_columns": (
-                self.training_dataset.reals
-                if self.training_dataset
-                else []
-            ),
+            "feature_columns": self.training_dataset.reals,
             "quantiles": self.quantiles,
             "directional_accuracy": self.training_history.get(
                 "directional_accuracy"
             ),
             "training_history": self.training_history,
             "training_time": datetime.now().isoformat(),
-            "lookback": (
-                self.training_dataset.max_encoder_length
-                if self.training_dataset
-                else None
-            ),
-            "horizon": (
-                self.training_dataset.max_prediction_length
-                if self.training_dataset
-                else None
-            ),
+            "lookback": self.training_dataset.max_encoder_length,
+            "horizon": self.training_dataset.max_prediction_length,
         }
 
         with open(metadata_path, "wb") as f:
@@ -1229,6 +1228,274 @@ class StreamingTFTTrainer:
                 f"⚠️ [{self.timeframe}] ONNX export skipped: "
                 "sequence_length or num_features missing"
             )
+
+        shutil.rmtree(Path(self.model_dir) / self.timeframe.lower())
+
+        self._log(
+            f"🧹 [{self.timeframe}] Temp checkpoint folder removed"
+        )
+
+        return True
+
+    def _compute_directional_accuracy(self, dataloader):
+        was_training = self.model.training
+        model_device = next(self.model.parameters()).device
+
+        self.model.eval()
+
+        correct = 0
+        total = 0
+        median_idx = len(self.quantiles) // 2
+
+        with torch.inference_mode():
+            for batch in dataloader:
+                x, y = batch
+
+                x = {
+                    k: v.to(model_device) if torch.is_tensor(v) else v
+                    for k, v in x.items()
+                }
+
+                out = self.model(x)
+                preds = out[0] if isinstance(out, tuple) else out
+
+                if preds.dim() == 3:
+                    preds_median = preds[..., median_idx]
+                elif preds.dim() == 2:
+                    preds_median = preds
+                else:
+                    continue
+
+                target = y[0] if isinstance(y, (tuple, list)) else y
+                target = target.to(model_device)
+
+                encoder_target = x["encoder_target"]
+
+                if isinstance(encoder_target, (list, tuple)):
+                    encoder_target = encoder_target[0]
+
+                encoder_target = encoder_target.to(model_device)
+
+                last_actual = encoder_target[:, -1].unsqueeze(-1)
+
+                actual_dir = torch.sign(target - last_actual)
+                pred_dir = torch.sign(preds_median - last_actual)
+
+                length = min(
+                    actual_dir.size(1),
+                    pred_dir.size(1)
+                )
+
+                if length == 0:
+                    continue
+
+                actual_dir = actual_dir[:, :length]
+                pred_dir = pred_dir[:, :length]
+
+                valid_mask = actual_dir != 0
+
+                correct += (
+                    (actual_dir == pred_dir) & valid_mask
+                ).sum().item()
+
+                total += valid_mask.sum().item()
+
+        self.model.train(was_training)
+
+        if total == 0:
+            return None
+
+        return correct / total
+
+    def _export_onnx(self, onnx_path, sequence_length, num_features):
+        class _TFTExportShim(torch.nn.Module):
+            def __init__(self, tft, input_keys):
+                super().__init__()
+                self.tft = tft
+                self.input_keys = input_keys
+
+            def forward(self, *inputs):
+                x = dict(zip(self.input_keys, inputs))
+                out = self.tft(x)
+                return out[0] if isinstance(out, tuple) else out
+
+        export_loader = self.validation_dataset.to_dataloader(
+            train=False,
+            batch_size=1,
+            num_workers=0
+        )
+
+        sample_x, sample_y = next(iter(export_loader))
+
+        input_keys = [
+            key for key, value in sample_x.items()
+            if torch.is_tensor(value)
+        ]
+
+        input_tensors = tuple(
+            sample_x[key].detach().cpu()
+            for key in input_keys
+        )
+
+        shim = _TFTExportShim(
+            self.model.to("cpu").eval(),
+            input_keys
+        )
+
+        dynamic_axes = {
+            key: {0: "batch_size"}
+            for key in input_keys
+        }
+
+        dynamic_axes["prediction"] = {
+            0: "batch_size"
+        }
+
+        torch.onnx.export(
+            shim,
+            input_tensors,
+            str(onnx_path),
+            input_names=input_keys,
+            output_names=["prediction"],
+            dynamic_axes=dynamic_axes,
+            opset_version=Config.ONNX_OPSET,
+            dynamo=False,
+        )
+
+        self._log(
+            f"✅ [{self.timeframe}] ONNX exported using actual TFT dataset inputs"
+        )
+
+        return True
+
+    def _compute_directional_accuracy(self, dataloader):
+        was_training = self.model.training
+        model_device = next(self.model.parameters()).device
+
+        self.model.eval()
+
+        correct = 0
+        total = 0
+        median_idx = len(self.quantiles) // 2
+
+        with torch.inference_mode():
+            for batch in dataloader:
+                x, y = batch
+
+                x = {
+                    k: v.to(model_device) if torch.is_tensor(v) else v
+                    for k, v in x.items()
+                }
+
+                out = self.model(x)
+                preds = out[0] if isinstance(out, tuple) else out
+
+                if preds.dim() == 3:
+                    preds_median = preds[..., median_idx]
+                elif preds.dim() == 2:
+                    preds_median = preds
+                else:
+                    continue
+
+                target = y[0] if isinstance(y, (tuple, list)) else y
+                target = target.to(model_device)
+
+                encoder_target = x["encoder_target"]
+
+                if isinstance(encoder_target, (list, tuple)):
+                    encoder_target = encoder_target[0]
+
+                encoder_target = encoder_target.to(model_device)
+
+                last_actual = encoder_target[:, -1].unsqueeze(-1)
+
+                actual_dir = torch.sign(target - last_actual)
+                pred_dir = torch.sign(preds_median - last_actual)
+
+                length = min(
+                    actual_dir.size(1),
+                    pred_dir.size(1)
+                )
+
+                if length == 0:
+                    continue
+
+                actual_dir = actual_dir[:, :length]
+                pred_dir = pred_dir[:, :length]
+
+                valid_mask = actual_dir != 0
+
+                correct += (
+                    (actual_dir == pred_dir) & valid_mask
+                ).sum().item()
+
+                total += valid_mask.sum().item()
+
+        self.model.train(was_training)
+
+        if total == 0:
+            return None
+
+        return correct / total
+
+    def _export_onnx(self, onnx_path, sequence_length, num_features):
+        class _TFTExportShim(torch.nn.Module):
+            def __init__(self, tft, input_keys):
+                super().__init__()
+                self.tft = tft
+                self.input_keys = input_keys
+
+            def forward(self, *inputs):
+                x = dict(zip(self.input_keys, inputs))
+                out = self.tft(x)
+                return out[0] if isinstance(out, tuple) else out
+
+        export_loader = self.validation_dataset.to_dataloader(
+            train=False,
+            batch_size=1,
+            num_workers=0
+        )
+
+        sample_x, sample_y = next(iter(export_loader))
+
+        input_keys = [
+            key for key, value in sample_x.items()
+            if torch.is_tensor(value)
+        ]
+
+        input_tensors = tuple(
+            sample_x[key].detach().cpu()
+            for key in input_keys
+        )
+
+        shim = _TFTExportShim(
+            self.model.to("cpu").eval(),
+            input_keys
+        )
+
+        dynamic_axes = {
+            key: {0: "batch_size"}
+            for key in input_keys
+        }
+
+        dynamic_axes["prediction"] = {
+            0: "batch_size"
+        }
+
+        torch.onnx.export(
+            shim,
+            input_tensors,
+            str(onnx_path),
+            input_names=input_keys,
+            output_names=["prediction"],
+            dynamic_axes=dynamic_axes,
+            opset_version=Config.ONNX_OPSET,
+            dynamo=False,
+        )
+
+        self._log(
+            f"✅ [{self.timeframe}] ONNX exported using actual TFT dataset inputs"
+        )
 
         return True
 
@@ -1445,13 +1712,13 @@ class TFTTrainerGUI(CTk):
         if cp.has_section("features"):
             self.feature_cols_var.set(
                 cp.get("features", "base_features",
-                    fallback="time,open,high,low,close,tick_volume")
+                    fallback=",".join(Config.DEFAULT_FEATURES))
             )
 
         if cp.has_section("indicators"):
             for var_name in self.indicator_vars:
                 self.indicator_vars[var_name].set(
-                    cp.getboolean("indicators", var_name, fallback=True)
+                    cp.getboolean("indicators", var_name, fallback=False)
                 )
 
         if cp.has_section("timeframes"):
@@ -1575,7 +1842,7 @@ class TFTTrainerGUI(CTk):
         frame.pack(fill="x", pady=(0, 4))
         feature_frame = CTkFrame(frame, fg_color="transparent")
         feature_frame.pack(fill="x", padx=8, pady=3)
-        self.feature_cols_var = tk.StringVar(value="time,open,high,low,close,tick_volume")
+        self.feature_cols_var = tk.StringVar(value=",".join(Config.DEFAULT_FEATURES))
         CTkLabel(feature_frame, text="Base Features (comma-separated):", font=("TkDefaultFont", 10)).pack(anchor="w", pady=(0, 2))
         CTkEntry(feature_frame, textvariable=self.feature_cols_var, height=28).pack(fill="x", pady=(0, 2))
 

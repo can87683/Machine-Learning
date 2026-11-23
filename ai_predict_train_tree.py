@@ -40,14 +40,14 @@ import functools
 
 class Config:
     HOME = pathlib.Path.home()
-    MODEL_DIR = HOME / "ai_model_ml_symbol"
+    MODEL_DIR = HOME / "ai_model_ml"
     DATASET_DIR = HOME / "mt5_data"
 
     REQUIRED_COLUMNS = ['time', 'open', 'high', 'low', 'close', 'tick_volume']
     FEATURE_COLUMNS = ['open', 'high', 'low', 'close', 'tick_volume']
     SYMBOL_PATTERN = r"(?!\.)[A-Za-z0-9._#+-]+"
     MAX_ROWS_PER_SYMBOL = 20000
-    WARMUP_BARS = 300
+    WARMUP_BARS = 0
     MIN_ROWS_AFTER_WARMUP = 1000
     VALIDATION_FRACTION = 0.15
 

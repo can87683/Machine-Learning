@@ -65,7 +65,7 @@ class Config:
         "H1": 1000,
         "H4": 1000,
         "D1": 700,
-        "W1": 500,
+        "W1": 490,
     }
     TIMEFRAME_HYPERPARAMS = {
         "M5":  {"epochs": 30, "hidden": 64, "dropout": 0.10, "weight_decay": 0.0001},
