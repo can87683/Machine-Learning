@@ -2,7 +2,7 @@
 
 Usage: Running as Python scripts is most efficient. Use ai_predict_train.py to include all trainers scripts and run efficiently with a click
 
-# One Python Venv for all scripts with one heavy Pytorch setup
+# One Python Venv for all ML trainer scripts with one heavy Pytorch setup
 # Machine-Learning-Model-Trainers
 
 Catboost (Categorical Boosting)
