@@ -1,4 +1,4 @@
-# Train with 10,000 bars multi-timeframe multi-symbols free data from any MT5 demo/trade account
+# Train with 10,000 bars multi-timeframe multi-symbols free data from MT5 or YFinance
 
 Usage: Running as Python scripts is most efficient. Use ai_predict_train.py to include all trainers scripts and run efficiently with a click
 
